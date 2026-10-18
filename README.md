@@ -139,36 +139,16 @@ Requires Xcode Command Line Tools (`AppleClang`), CMake 3.20+, Ninja, and Python
    ./scripts/recompile_level.sh --all
    ```
 
-### Windows (x86-64)
-
-```powershell
-.\scripts\recompile.ps1 -BuildTools -BuildLib -BuildHost
-```
-
-Needs CMake 3.20+, Ninja, Clang, and the Visual Studio Build Tools for the
-Windows SDK headers. Clang is required, not preferred.
-
-Put your own `default.xex` in `CoD3RecompLib/private/` first, so the recompiler
-has something to translate. No game files are included here.
-
 ## Verifying
-
-### macOS (Apple Silicon ARM64)
 
 ```bash
 ./scripts/verify.sh          # the instructions this project added
 ./scripts/verify.sh --all    # every test Xenia has that PpcAsm encodes cleanly
 ```
 
-### Windows (x86-64)
-
-```powershell
-.\scripts\verify.ps1        # the instructions this project added
-.\scripts\verify.ps1 -All   # every test Xenia has
-```
-
 Assembles Xenia's instruction tests, recompiles them the same way the game's
 code is recompiled, runs them, and reports any register that comes out wrong.
+
 
 ## Running
 
@@ -230,9 +210,9 @@ executable starts again with the title's launch data (`COD3_LAUNCHDATA`).
 | `scripts/sendkeys.py` | Posts keys to the game's window without taking the focus, for scripted runs (the console included) |
 | `CoD3Host/overlay.cpp`, `settings.cpp` | The settings menu (Dear ImGui) and its file |
 | `tools/CoD3Scan/` | XEX analysis: finds required addresses, repairs function boundaries, lists imports |
-| `scripts/recompile.ps1`, `scripts/recompile.sh` | The whole pipeline on Windows and macOS, the coroutine patch (`scripts/patch_recomp.py main`) included; running XenonRecomp by hand needs that patch afterwards or the first level's scripts spin forever |
-| `scripts/recompile_level.ps1`, `scripts/recompile_level.sh` | Per-level DLL static recompilation on Windows and macOS |
-| `scripts/verify.ps1`, `scripts/verify.sh` | Checks the recompiler against Xenia's instruction tests on Windows and macOS |
+| `scripts/recompile.sh` | The whole pipeline on macOS, the coroutine patch (`scripts/patch_recomp.py main`) included; running XenonRecomp by hand needs that patch afterwards or the first level's scripts spin forever |
+| `scripts/recompile_level.sh` | Per-level DLL static recompilation on macOS |
+| `scripts/verify.sh` | Checks the recompiler against Xenia's instruction tests on macOS |
 | `scripts/extract_iso.py` | Standalone Xbox 360 XDVDFS `.iso` reader and extractor |
 | `tools/PpcAsm/` | A PowerPC assembler, built from the project's own opcode tables |
 | `CoD3Host/gpu.cpp` | The GPU register aperture and the PM4 command processor |

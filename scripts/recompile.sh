@@ -7,7 +7,7 @@
 #   ./scripts/recompile.sh --build-lib     # also compile CoD3RecompLib
 #   ./scripts/recompile.sh --iso <path>    # extract default.xex from ISO first if needed
 #
-# The CoD3 host executable (CoD3Host) is Windows-only for now; use recompile.ps1 -BuildHost on Windows.
+# The CoD3 host executable (CoD3Host) is Windows-only for now and has not yet been ported to macOS.
 
 set -euo pipefail
 
@@ -26,8 +26,8 @@ while [[ $# -gt 0 ]]; do
         --switch-tables|-SwitchTables) SWITCH_TABLES=1; shift ;;
         --build-lib|-BuildLib) BUILD_LIB=1; shift ;;
         --build-host|-BuildHost)
-            echo "Error: $1 is Windows-only for now: CoD3Host uses Win32 and its CMakeLists.txt rejects non-Windows builds." >&2
-            echo "       Use --build-lib on macOS, or scripts/recompile.ps1 -BuildHost on Windows." >&2
+            echo "Error: $1 cannot be built on macOS: CoD3Host uses Win32 and has not been ported yet." >&2
+            echo "       Use --build-lib to build CoD3RecompLib." >&2
             exit 1 ;;
         --iso) ISO_PATH="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;

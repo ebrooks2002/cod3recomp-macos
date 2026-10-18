@@ -12,7 +12,7 @@ chain's "not found" tail), and the rest of the function became one or more
 This reads the generated code, groups each such branch with the function
 that holds its target, and writes the group's extent, from the first piece
 to the end of the last, into config/<name>_functions.toml, which
-scripts/recompile_level.ps1 merges into the level's config on every pass.
+scripts/recompile_level.sh merges into the level's config on every pass.
 It is run again after each recompile until nothing changes: a tail that
 had itself been cut short shows up as a new piece the next time.
 

@@ -34,6 +34,16 @@ COVERED=(
     vpkshss vpkuhus
 )
 
+is_covered() {
+    local target="$1"
+    for op in "${COVERED[@]}"; do
+        if [[ "$target" == "instr_$op" || "$target" == "$op" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # --- 1. Test sources -------------------------------------------------------
 if [[ "$FETCH" -eq 1 || ! -f "$TESTS/instr_add.s" ]]; then
     echo "==> Fetching Xenia instruction tests"
@@ -47,6 +57,13 @@ if [[ "$FETCH" -eq 1 || ! -f "$TESTS/instr_add.s" ]]; then
     git -C "$CLONE" fetch --depth 1 origin master -q
     git -C "$CLONE" checkout -q FETCH_HEAD
 fi
+
+for op in "${COVERED[@]}"; do
+    if [[ ! -f "$TESTS/instr_$op.s" ]]; then
+        echo "Error: missing test source for covered test: $TESTS/instr_$op.s" >&2
+        exit 1
+    fi
+done
 
 # --- 2. Tools --------------------------------------------------------------
 echo "==> Building the assembler and the recompiler"
@@ -64,15 +81,35 @@ ASM="$BUILD/PpcAsm/PpcAsm"
 
 clean=0
 problems=0
+skipped_asm=()
+failed_covered=()
+
 for source in "$TESTS"/*.s; do
     name="$(basename "$source" .s)"
-    if "$ASM" "$source" "$BIN/$name.o" "$BIN/$name.dis" 0x10000 >/dev/null 2>&1; then
+    set +e
+    asm_out="$("$ASM" "$source" "$BIN/$name.o" "$BIN/$name.dis" 0x10000 2>&1)"
+    asm_status=$?
+    set -e
+    if [[ $asm_status -eq 0 && -f "$BIN/$name.o" && -f "$BIN/$name.dis" ]]; then
         clean=$((clean + 1))
     else
         rm -f "$BIN/$name.o" "$BIN/$name.dis"
         problems=$((problems + 1))
+        skipped_asm+=("$name")
+        if is_covered "$name"; then
+            failed_covered+=("$name: $asm_out")
+        fi
     fi
 done
+
+if [[ ${#failed_covered[@]} -gt 0 ]]; then
+    echo "Error: covered test(s) failed to assemble:" >&2
+    for err in "${failed_covered[@]}"; do
+        echo "  $err" >&2
+    done
+    exit 1
+fi
+
 echo "    $clean assembled cleanly, $problems had instructions the assembler cannot encode"
 
 # --- 4. Select -------------------------------------------------------------
@@ -85,19 +122,70 @@ else
     for op in "${COVERED[@]}"; do
         for ext in o dis; do
             file="$BIN/instr_$op.$ext"
-            if [[ -f "$file" ]]; then
-                cp "$file" "$SELECTED/"
+            if [[ ! -f "$file" ]]; then
+                echo "Error: covered test file missing: $file" >&2
+                exit 1
             fi
+            cp "$file" "$SELECTED/"
         done
     done
     count="$(find "$SELECTED" -maxdepth 1 -name '*.o' | wc -l | tr -d ' ')"
+    if (( count != ${#COVERED[@]} )); then
+        echo "Error: expected ${#COVERED[@]} covered tests, found $count" >&2
+        exit 1
+    fi
     echo "    testing the $count instructions this project added"
 fi
 
 # --- 5. Recompile and run --------------------------------------------------
 echo "==> Recompiling the tests"
 rm -f "$HARNESS"/*.cpp
-"$TOOL_BUILD/XenonRecomp/XenonRecomp" "$SELECTED" "$HARNESS" >/dev/null
+
+set +e
+recomp_output="$("$TOOL_BUILD/XenonRecomp/XenonRecomp" "$SELECTED" "$HARNESS" 2>&1)"
+recomp_status=$?
+set -e
+
+skipped_fns="$(printf "%s\n" "$recomp_output" | grep -E "has unimplemented instructions|Unrecognized instruction" || true)"
+missing_syms="$(printf "%s\n" "$recomp_output" | grep "Found no symbol" || true)"
+missing_srcs="$(printf "%s\n" "$recomp_output" | grep "Unable to locate" || true)"
+
+if [[ $recomp_status -ne 0 || -n "$skipped_fns" || -n "$missing_syms" || -n "$missing_srcs" ]]; then
+    echo "Error: test recompilation failed or omitted tests during generation:" >&2
+    if [[ -n "$skipped_fns" ]]; then
+        printf "%s\n" "$skipped_fns" | sed 's/^/  /' >&2
+    fi
+    if [[ -n "$missing_syms" ]]; then
+        printf "%s\n" "$missing_syms" | sed 's/^/  /' >&2
+    fi
+    if [[ -n "$missing_srcs" ]]; then
+        printf "%s\n" "$missing_srcs" | sed 's/^/  /' >&2
+    fi
+    if [[ $recomp_status -ne 0 && -z "$skipped_fns" && -z "$missing_syms" && -z "$missing_srcs" ]]; then
+        printf "%s\n" "$recomp_output" | sed 's/^/  /' >&2
+    fi
+    exit 1
+fi
+
+if [[ ! -f "$HARNESS/main.cpp" ]]; then
+    echo "Error: test harness main.cpp was not generated" >&2
+    exit 1
+fi
+
+test_count="$(grep -cE '^\s*test_[a-zA-Z0-9_]+\(base\);' "$HARNESS/main.cpp" || true)"
+if (( test_count == 0 )); then
+    echo "Error: test runner is empty (no tests generated)" >&2
+    exit 1
+fi
+
+if [[ "$ALL" -eq 0 ]]; then
+    for op in "${COVERED[@]}"; do
+        if ! grep -qE "^\s*test_${op}_" "$HARNESS/main.cpp"; then
+            echo "Error: no tests generated for covered instruction $op" >&2
+            exit 1
+        fi
+    done
+fi
 
 echo "==> Building and running"
 cmake -S "$ROOT/tools/XenonRecomp" -B "$TOOL_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -122,4 +210,10 @@ fi
 if [[ -n "$failures" ]] || (( status != 0 )); then
     exit 1
 fi
-echo "Every check passed: each instruction produced the registers the hardware does."
+
+if [[ "$ALL" -eq 1 ]]; then
+    echo "Every check passed: all $test_count tests passed across $clean instruction test files."
+    echo "Intentional assembly skips: $problems tests (instructions the assembler cannot encode)."
+else
+    echo "Every check passed: all $test_count tests passed across ${#COVERED[@]} covered instructions."
+fi
