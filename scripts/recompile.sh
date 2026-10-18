@@ -2,7 +2,7 @@
 # Regenerates the recompiled C++ for Call of Duty 3 from default.xex on macOS (ARM64).
 #
 #   ./scripts/recompile.sh                 # regenerate C++ only
-#   ./scripts/recompile.sh --build-tools   # rebuild XenonRecomp first
+#   ./scripts/recompile.sh --build-tools   # rebuild XenonRecomp, XenonAnalyse and CoD3Scan first
 #   ./scripts/recompile.sh --switch-tables # regenerate the jump table TOML too
 #   ./scripts/recompile.sh --build-lib     # also compile CoD3RecompLib
 #   ./scripts/recompile.sh --build-host    # also compile CoD3 host executable
@@ -39,6 +39,8 @@ CONTEXT_HDR="$ROOT/tools/XenonRecomp/XenonUtils/ppc_context.h"
 TOOL_BUILD="$ROOT/tools/build"
 RECOMP="$TOOL_BUILD/XenonRecomp/XenonRecomp"
 ANALYSE="$TOOL_BUILD/XenonAnalyse/XenonAnalyse"
+SCAN_BUILD="$ROOT/tools/build-scan"
+SCAN="$SCAN_BUILD/CoD3Scan"
 
 mkdir -p "$ROOT/CoD3RecompLib/private"
 
@@ -65,10 +67,15 @@ if [[ ! -f "$XEX" ]]; then
 fi
 
 # --- 1. Host tools ---------------------------------------------------------
-if [[ "$BUILD_TOOLS" -eq 1 || ! -x "$RECOMP" ]]; then
+if [[ "$BUILD_TOOLS" -eq 1 || ! -x "$RECOMP" || ! -x "$ANALYSE" ]]; then
     echo "==> Building XenonRecomp and XenonAnalyse"
     cmake -S "$ROOT/tools/XenonRecomp" -B "$TOOL_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
     cmake --build "$TOOL_BUILD" --target XenonRecomp XenonAnalyse --parallel "$JOBS"
+fi
+if [[ "$BUILD_TOOLS" -eq 1 || ! -x "$SCAN" ]]; then
+    echo "==> Building CoD3Scan"
+    cmake -S "$ROOT/tools/CoD3Scan" -B "$SCAN_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$SCAN_BUILD" --target CoD3Scan --parallel "$JOBS"
 fi
 
 # --- 2. Jump tables --------------------------------------------------------
