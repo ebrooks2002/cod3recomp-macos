@@ -5,8 +5,9 @@
 #   ./scripts/recompile.sh --build-tools   # rebuild XenonRecomp, XenonAnalyse and CoD3Scan first
 #   ./scripts/recompile.sh --switch-tables # regenerate the jump table TOML too
 #   ./scripts/recompile.sh --build-lib     # also compile CoD3RecompLib
-#   ./scripts/recompile.sh --build-host    # also compile CoD3 host executable
 #   ./scripts/recompile.sh --iso <path>    # extract default.xex from ISO first if needed
+#
+# The CoD3 host executable (CoD3Host) is Windows-only for now; use recompile.ps1 -BuildHost on Windows.
 
 set -euo pipefail
 
@@ -16,7 +17,6 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 BUILD_TOOLS=0
 SWITCH_TABLES=0
 BUILD_LIB=0
-BUILD_HOST=0
 ISO_PATH=""
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 
@@ -25,7 +25,10 @@ while [[ $# -gt 0 ]]; do
         --build-tools|-BuildTools) BUILD_TOOLS=1; shift ;;
         --switch-tables|-SwitchTables) SWITCH_TABLES=1; shift ;;
         --build-lib|-BuildLib) BUILD_LIB=1; shift ;;
-        --build-host|-BuildHost) BUILD_HOST=1; shift ;;
+        --build-host|-BuildHost)
+            echo "Error: $1 is Windows-only for now: CoD3Host uses Win32 and its CMakeLists.txt rejects non-Windows builds." >&2
+            echo "       Use --build-lib on macOS, or scripts/recompile.ps1 -BuildHost on Windows." >&2
+            exit 1 ;;
         --iso) ISO_PATH="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -117,32 +120,20 @@ echo "==> Patching the coroutine seam"
 python3 "$ROOT/scripts/patch_recomp.py" main
 
 # --- 4. Compile ------------------------------------------------------------
-if [[ "$BUILD_LIB" -eq 1 || "$BUILD_HOST" -eq 1 ]]; then
+if [[ "$BUILD_LIB" -eq 1 ]]; then
     echo "==> Generating kernel import stubs"
     python3 "$ROOT/scripts/gen_import_stubs.py"
 
     echo "==> Compiling"
     BUILD="$ROOT/build"
-    HOST_FLAG="-DCOD3_BUILD_HOST=OFF"
-    if [[ "$BUILD_HOST" -eq 1 ]]; then
-        HOST_FLAG="-DCOD3_BUILD_HOST=ON"
-    fi
-    cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release "$HOST_FLAG"
-    if [[ "$BUILD_HOST" -eq 1 ]]; then
-        cmake --build "$BUILD" --target CoD3 --parallel "$JOBS"
-    else
-        cmake --build "$BUILD" --target CoD3RecompLib --parallel "$JOBS"
-    fi
+    # CoD3Host is Windows-only; force it off so a stale cache entry can't re-enable it.
+    cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCOD3_BUILD_HOST=OFF
+    cmake --build "$BUILD" --target CoD3RecompLib --parallel "$JOBS"
 
     LIB="$BUILD/CoD3RecompLib/libCoD3RecompLib.a"
     if [[ -f "$LIB" ]]; then
         size_mb="$(du -m "$LIB" | cut -f1)"
         echo "    $LIB (${size_mb} MB)"
-    fi
-    EXE="$BUILD/CoD3Host/CoD3"
-    if [[ -f "$EXE" ]]; then
-        size_mb="$(du -m "$EXE" | cut -f1)"
-        echo "    $EXE (${size_mb} MB)"
     fi
 fi
 
