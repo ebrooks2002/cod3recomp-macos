@@ -105,15 +105,21 @@ cmake --build "$TOOL_BUILD" --target XenonTests --parallel "$JOBS"
 
 set +e
 output="$("$TOOL_BUILD/XenonTests/XenonTests" 2>&1)"
-failures="$(printf "%s\n" "$output" | grep "EXPECTED" || true)"
+status=$?
 set -e
+failures="$(printf "%s\n" "$output" | grep "EXPECTED" || true)"
 
 echo ""
-if [[ -z "$failures" ]]; then
-    echo "Every check passed: each instruction produced the registers the hardware does."
-else
+if [[ -n "$failures" ]]; then
     fail_count="$(printf "%s\n" "$failures" | wc -l | tr -d ' ')"
     echo "$fail_count checks failed:"
     printf "%s\n" "$failures" | head -n 40 | sed 's/^/  /'
+fi
+if (( status != 0 )); then
+    echo "XenonTests exited with status $status (crash or trap?). Last output:"
+    printf "%s\n" "$output" | tail -n 20 | sed 's/^/  /'
+fi
+if [[ -n "$failures" ]] || (( status != 0 )); then
     exit 1
 fi
+echo "Every check passed: each instruction produced the registers the hardware does."
