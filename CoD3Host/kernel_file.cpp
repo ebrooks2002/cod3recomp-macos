@@ -22,7 +22,7 @@ namespace { constexpr uint32_t X_STATUS_PENDING = 0x00000103; }
 #include <mutex>
 #include <string>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace fs = std::filesystem;
 

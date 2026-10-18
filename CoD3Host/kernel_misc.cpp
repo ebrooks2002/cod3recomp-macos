@@ -19,7 +19,7 @@
 #include <cstring>
 #include <string>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {
@@ -434,12 +434,13 @@ void Mmio::LongJump(PPCContext& ctx, uint8_t* base, jmp_buf& buffer, int value)
     // A script thread yielding: the engine's fiber does the longjmp.
     if (Coroutines::YieldIfCoroutine(buffer, value)) return;
 
-    const auto* frame = reinterpret_cast<const _JUMP_BUFFER*>(&buffer);
+    uintptr_t sp = 0, ip = 0;
+    Platform::InspectJumpBuffer(buffer, sp, ip);
     ULONG_PTR low = 0, high = 0;
     GetCurrentThreadStackLimits(&low, &high);
-    const bool stackOk = frame->Rsp >= low && frame->Rsp < high;
+    const bool stackOk = sp >= low && sp < high;
     MEMORY_BASIC_INFORMATION info{};
-    const bool codeOk = VirtualQuery(reinterpret_cast<void*>(frame->Rip), &info, sizeof(info)) != 0
+    const bool codeOk = VirtualQuery(reinterpret_cast<void*>(ip), &info, sizeof(info)) != 0
         && (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
     if (stackOk && codeOk)
         longjmp(buffer, value);
@@ -447,8 +448,8 @@ void Mmio::LongJump(PPCContext& ctx, uint8_t* base, jmp_buf& buffer, int value)
     printf("\nlongjmp: the title longjmp'd with %d through the buffer at 0x%08X, which no "
            "host setjmp filled in this frame:\n  host stack pointer %p (this thread's stack is %p..%p), "
            "return address %p%s\n",
-        value, uint32_t(reinterpret_cast<uint8_t*>(&buffer) - base), (void*)frame->Rsp,
-        (void*)low, (void*)high, (void*)frame->Rip, codeOk ? "" : ", not code");
+        value, uint32_t(reinterpret_cast<uint8_t*>(&buffer) - base), (void*)sp,
+        (void*)low, (void*)high, (void*)ip, codeOk ? "" : ", not code");
     printf("  the buffer's first words:");
     for (int i = 0; i < 8; i++)
         printf(" %08X", Guest::Read32(base, uint32_t(reinterpret_cast<uint8_t*>(&buffer) - base) + i * 4));

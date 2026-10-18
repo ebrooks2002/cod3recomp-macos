@@ -40,7 +40,7 @@
 #include <condition_variable>
 #include <thread>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {

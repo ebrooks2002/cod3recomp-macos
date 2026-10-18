@@ -21,7 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {

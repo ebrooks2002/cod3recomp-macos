@@ -27,7 +27,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
-#include <Windows.h>
+#include "platform.h"
 #include <map>
 
 namespace

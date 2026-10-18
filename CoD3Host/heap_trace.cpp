@@ -21,7 +21,7 @@
 #include <mutex>
 #include <unordered_set>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {

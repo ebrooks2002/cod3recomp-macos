@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <set>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {

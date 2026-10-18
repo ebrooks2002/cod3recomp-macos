@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {

@@ -6,8 +6,10 @@
 #include <string>
 #include <vector>
 
-#include <Windows.h>
+#include "platform.h"
+#ifdef _WIN32
 #include <ShObjIdl.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -62,6 +64,7 @@ namespace
 
     bool PickWithDialog(bool wantFolder, const wchar_t* title, fs::path& chosen)
     {
+#ifdef _WIN32
         bool picked = false;
         HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
@@ -104,6 +107,9 @@ namespace
 
         if (SUCCEEDED(initialized)) CoUninitialize();
         return picked;
+#else
+        return Platform::OpenFileDialog(wantFolder, Utf8(title).c_str(), chosen);
+#endif
     }
 
     // --- Copying ----------------------------------------------------------

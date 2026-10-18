@@ -44,7 +44,7 @@
 #include <vector>
 #include <mutex>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {

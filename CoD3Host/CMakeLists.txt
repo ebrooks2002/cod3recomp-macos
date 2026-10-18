@@ -8,15 +8,18 @@ project("CoD3Host" CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if (NOT WIN32)
-    message(FATAL_ERROR "The host is Windows only for now: it uses Win32 for the "
-                        "address space reservation and the file pickers.")
+if (NOT WIN32 AND NOT APPLE)
+    message(FATAL_ERROR "The host is Windows or macOS only for now.")
 endif()
 
-# The icon and version information. RC_DEPENDS makes a change to the icon
-# rebuild the executable, which it otherwise would not.
-enable_language(RC)
-set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} /I\"${CMAKE_CURRENT_SOURCE_DIR}/resources\"")
+if (WIN32)
+    # The icon and version information. RC_DEPENDS makes a change to the icon
+    # rebuild the executable, which it otherwise would not.
+    enable_language(RC)
+    set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} /I\"${CMAKE_CURRENT_SOURCE_DIR}/resources\"")
+elseif (APPLE)
+    enable_language(OBJCXX)
+endif()
 
 add_executable(CoD3 WIN32
     "log.cpp"
@@ -75,8 +78,13 @@ add_executable(CoD3 WIN32
     "write_watch.cpp"
     "watchdog.cpp"
     "modules.cpp"
-    "coroutines.cpp"
-    "resources/CoD3.rc")
+    "coroutines.cpp")
+
+if (WIN32)
+    target_sources(CoD3 PRIVATE "resources/CoD3.rc")
+elseif (APPLE)
+    target_sources(CoD3 PRIVATE "platform_macos.mm")
+endif()
 
 # A console application: setup is interactive and the import trap has to be
 # readable. WIN32 above is overridden here deliberately.

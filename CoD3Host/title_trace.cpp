@@ -14,7 +14,7 @@
 #include <map>
 #include <string>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {
