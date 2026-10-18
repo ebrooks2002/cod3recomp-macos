@@ -164,6 +164,21 @@ void Log::Start()
     const bool hasStdout = (::fstat(STDOUT_FILENO, &st) == 0);
     if (hasStdout && (S_ISREG(st.st_mode) || S_ISFIFO(st.st_mode))) return;
 
+    const bool hasStdin = (::fcntl(STDIN_FILENO, F_GETFD) != -1);
+    const bool hasStderr = (::fcntl(STDERR_FILENO, F_GETFD) != -1);
+    if (!hasStdin || !hasStdout || !hasStderr)
+    {
+        const int nullFd = ::open("/dev/null", O_RDWR);
+        if (nullFd < 0) return;
+        if (!hasStdin && nullFd != STDIN_FILENO) ::dup2(nullFd, STDIN_FILENO);
+        if (!hasStdout && nullFd != STDOUT_FILENO) ::dup2(nullFd, STDOUT_FILENO);
+        if (!hasStderr && nullFd != STDERR_FILENO) ::dup2(nullFd, STDERR_FILENO);
+        if (nullFd > STDERR_FILENO) ::close(nullFd);
+        if (!hasStdin) (void)freopen("/dev/null", "r", stdin);
+        if (!hasStdout) (void)freopen("/dev/null", "w", stdout);
+        if (!hasStderr) (void)freopen("/dev/null", "w", stderr);
+    }
+
     const std::filesystem::path directory = Platform::ExecutableDirectory();
     const std::filesystem::path path = setting != nullptr && setting[0] != 0 && strcmp(setting, "1") != 0
         ? std::filesystem::path(setting) : directory / "CoD3.log";
@@ -192,11 +207,12 @@ void Log::Start()
     ::fcntl(pipeFds[0], F_SETFD, FD_CLOEXEC);
     ::fcntl(pipeFds[1], F_SETFD, FD_CLOEXEC);
 
-    if (!hasStdout)
-    {
-        (void)freopen("/dev/null", "w", stdout);
-        (void)freopen("/dev/null", "w", stderr);
-    }
+    const int origOutFd = (consoleFd >= 0) ? consoleFd : ::dup(STDOUT_FILENO);
+    const int origErrFd = ::dup(STDERR_FILENO);
+    if (origOutFd >= 0 && origOutFd != consoleFd) ::fcntl(origOutFd, F_SETFD, FD_CLOEXEC);
+    if (origErrFd >= 0) ::fcntl(origErrFd, F_SETFD, FD_CLOEXEC);
+    Platform::RecordOriginalStdioFds(origOutFd, origErrFd);
+
     fflush(stdout);
     fflush(stderr);
     ::dup2(pipeFds[1], STDOUT_FILENO);

@@ -500,19 +500,20 @@ inline void GetSystemTimePreciseAsFileTime(FILETIME* ft)
 inline BOOL FileTimeToSystemTime(const FILETIME* ft, SYSTEMTIME* st)
 {
     if (!ft || !st) return FALSE;
-    constexpr uint64_t EpochDifference100ns = 116444736000000000ULL;
     const uint64_t ticks = (static_cast<uint64_t>(ft->dwHighDateTime) << 32) | ft->dwLowDateTime;
-    if (ticks < EpochDifference100ns)
+    if (ticks >= 0x8000000000000000ULL) return FALSE;
+    constexpr int64_t EpochDifference100ns = 116444736000000000LL;
+    constexpr int64_t TicksPerSecond       = 10000000LL;
+    const int64_t signed100ns = static_cast<int64_t>(ticks) - EpochDifference100ns;
+    int64_t secs64  = signed100ns / TicksPerSecond;
+    int64_t rem100ns = signed100ns % TicksPerSecond;
+    if (rem100ns < 0)
     {
-        memset(st, 0, sizeof(*st));
-        st->wYear = 1601;
-        st->wMonth = 1;
-        st->wDay = 1;
-        return TRUE;
+        secs64 -= 1;
+        rem100ns += TicksPerSecond;
     }
-    const uint64_t unix100ns = ticks - EpochDifference100ns;
-    const time_t secs = static_cast<time_t>(unix100ns / 10000000ULL);
-    const WORD millis = static_cast<WORD>((unix100ns / 10000ULL) % 1000ULL);
+    const time_t secs = static_cast<time_t>(secs64);
+    const WORD millis = static_cast<WORD>((rem100ns / 10000LL) % 1000LL);
     struct tm utc{};
     if (!gmtime_r(&secs, &utc)) return FALSE;
     st->wYear         = static_cast<WORD>(utc.tm_year + 1900);
@@ -529,6 +530,14 @@ inline BOOL FileTimeToSystemTime(const FILETIME* ft, SYSTEMTIME* st)
 inline BOOL SystemTimeToFileTime(const SYSTEMTIME* st, FILETIME* ft)
 {
     if (!st || !ft) return FALSE;
+    if (st->wYear < 1601 || st->wYear > 30827 ||
+        st->wMonth < 1 || st->wMonth > 12 ||
+        st->wDay < 1 || st->wDay > 31 ||
+        st->wHour > 23 || st->wMinute > 59 ||
+        st->wSecond > 59 || st->wMilliseconds > 999)
+    {
+        return FALSE;
+    }
     struct tm utc{};
     utc.tm_year = int(st->wYear) - 1900;
     utc.tm_mon  = int(st->wMonth) - 1;
@@ -537,11 +546,23 @@ inline BOOL SystemTimeToFileTime(const SYSTEMTIME* st, FILETIME* ft)
     utc.tm_min  = int(st->wMinute);
     utc.tm_sec  = int(st->wSecond);
     const time_t secs = timegm(&utc);
-    if (secs == static_cast<time_t>(-1)) return FALSE;
-    constexpr uint64_t EpochDifference100ns = 116444736000000000ULL;
-    const uint64_t ticks = EpochDifference100ns
-        + static_cast<uint64_t>(secs) * 10000000ULL
-        + static_cast<uint64_t>(st->wMilliseconds) * 10000ULL;
+    struct tm check{};
+    if (!gmtime_r(&secs, &check)) return FALSE;
+    if (check.tm_year != int(st->wYear) - 1900 ||
+        check.tm_mon  != int(st->wMonth) - 1 ||
+        check.tm_mday != int(st->wDay) ||
+        check.tm_hour != int(st->wHour) ||
+        check.tm_min  != int(st->wMinute) ||
+        check.tm_sec  != int(st->wSecond))
+    {
+        return FALSE;
+    }
+    constexpr int64_t EpochDifference100ns = 116444736000000000LL;
+    const int64_t signedTicks = EpochDifference100ns
+        + static_cast<int64_t>(secs) * 10000000LL
+        + static_cast<int64_t>(st->wMilliseconds) * 10000LL;
+    if (signedTicks < 0) return FALSE;
+    const uint64_t ticks = static_cast<uint64_t>(signedTicks);
     ft->dwLowDateTime  = static_cast<DWORD>(ticks & 0xFFFFFFFFULL);
     ft->dwHighDateTime = static_cast<DWORD>(ticks >> 32);
     return TRUE;
@@ -549,22 +570,34 @@ inline BOOL SystemTimeToFileTime(const SYSTEMTIME* st, FILETIME* ft)
 
 // --- Error helpers ----------------------------------------------------------
 
+inline constexpr DWORD ERROR_IO_DEVICE = 1117u;
+
 inline DWORD GetLastError()
 {
+    if (errno == 0) return ERROR_SUCCESS;
     if (errno == EACCES || errno == EPERM) return ERROR_ACCESS_DENIED;
     if (errno == ENOENT) return ERROR_FILE_NOT_FOUND;
+    if (errno == EIO) return ERROR_IO_DEVICE;
     return static_cast<DWORD>(errno);
 }
 
 inline void SetLastError(DWORD err)
 {
-    errno = static_cast<int>(err);
+    if (err == ERROR_SUCCESS)            errno = 0;
+    else if (err == ERROR_ACCESS_DENIED) errno = EACCES;
+    else if (err == ERROR_FILE_NOT_FOUND) errno = ENOENT;
+    else if (err == ERROR_IO_DEVICE)     errno = EIO;
+    else                                 errno = static_cast<int>(err);
 }
 
 inline DWORD FormatMessageA(DWORD, LPCVOID, DWORD dwMessageId, DWORD, LPSTR lpBuffer, DWORD nSize, va_list*)
 {
     if (!lpBuffer || nSize == 0) return 0;
-    const char* msg = strerror(static_cast<int>(dwMessageId));
+    int posixErr = static_cast<int>(dwMessageId);
+    if (dwMessageId == ERROR_ACCESS_DENIED)       posixErr = EACCES;
+    else if (dwMessageId == ERROR_FILE_NOT_FOUND) posixErr = ENOENT;
+    else if (dwMessageId == ERROR_IO_DEVICE)      posixErr = EIO;
+    const char* msg = (dwMessageId == ERROR_SUCCESS) ? "Success" : strerror(posixErr);
     if (!msg) msg = "Unknown error";
     snprintf(lpBuffer, nSize, "%s", msg);
     return static_cast<DWORD>(strlen(lpBuffer));
@@ -751,5 +784,14 @@ namespace Platform
 
     // Relaunches the current executable with COD3_LAUNCHDATA pointing to launchDataFile.
     bool RelaunchProcess(const std::filesystem::path& launchDataFile);
+
+    inline int g_originalStdoutFd = -1;
+    inline int g_originalStderrFd = -1;
+
+    inline void RecordOriginalStdioFds(int stdoutFd, int stderrFd)
+    {
+        g_originalStdoutFd = stdoutFd;
+        g_originalStderrFd = stderrFd;
+    }
 #endif
 }

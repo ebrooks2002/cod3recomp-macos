@@ -13,8 +13,14 @@
 #include <spawn.h>
 #include <sys/stat.h>
 
+#include <mutex>
+#include <unordered_map>
+
 namespace
 {
+    std::mutex g_allocMutex;
+    std::unordered_map<uintptr_t, size_t> g_virtualAllocations;
+
     int WinProtToPosix(DWORD flProtect)
     {
         switch (flProtect & 0xFFu)
@@ -101,6 +107,10 @@ void* VirtualAlloc(void* lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD
         const size_t alignedSize = (dwSize + pageSize - 1) & ~(pageSize - 1);
         void* mapped = mmap(nullptr, alignedSize, prot, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (mapped == MAP_FAILED) return nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_allocMutex);
+            g_virtualAllocations[reinterpret_cast<uintptr_t>(mapped)] = alignedSize;
+        }
         return mapped;
     }
 
@@ -161,10 +171,22 @@ BOOL VirtualFree(void* lpAddress, SIZE_T dwSize, DWORD dwFreeType)
 
     if (dwFreeType & MEM_RELEASE)
     {
-        if (dwSize == 0) return TRUE;
         const uintptr_t start = reinterpret_cast<uintptr_t>(lpAddress) & ~(pageSize - 1);
-        const size_t alignedSize = (dwSize + pageSize - 1) & ~(pageSize - 1);
-        return munmap(reinterpret_cast<void*>(start), alignedSize) == 0 ? TRUE : FALSE;
+        size_t releaseSize = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_allocMutex);
+            auto it = g_virtualAllocations.find(start);
+            if (it != g_virtualAllocations.end())
+            {
+                releaseSize = it->second;
+                g_virtualAllocations.erase(it);
+            }
+        }
+        if (dwSize != 0)
+            releaseSize = (dwSize + pageSize - 1) & ~(pageSize - 1);
+        if (releaseSize == 0)
+            return FALSE;
+        return munmap(reinterpret_cast<void*>(start), releaseSize) == 0 ? TRUE : FALSE;
     }
 
     if ((dwFreeType & MEM_DECOMMIT) && dwSize > 0)
@@ -285,10 +307,10 @@ HANDLE CreateFileW(const char* lpFileName, DWORD dwDesiredAccess, DWORD,
 
     const bool read  = (dwDesiredAccess & GENERIC_READ) != 0;
     const bool write = (dwDesiredAccess & GENERIC_WRITE) != 0;
-    int flags = 0;
-    if (read && write) flags = O_RDWR;
-    else if (write)    flags = O_WRONLY;
-    else               flags = O_RDONLY;
+    int flags = O_CLOEXEC;
+    if (read && write) flags |= O_RDWR;
+    else if (write)    flags |= O_WRONLY;
+    else               flags |= O_RDONLY;
 
     switch (dwCreationDisposition)
     {
@@ -304,7 +326,7 @@ HANDLE CreateFileW(const char* lpFileName, DWORD dwDesiredAccess, DWORD,
     {
         struct stat st{};
         if (stat(lpFileName, &st) == 0 && S_ISDIR(st.st_mode))
-            flags = O_RDONLY | O_DIRECTORY;
+            flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
     }
 
     const int fd = open(lpFileName, flags, 0644);
@@ -673,9 +695,18 @@ namespace Platform
             envPtrs.push_back(s.data());
         envPtrs.push_back(nullptr);
 
+        posix_spawn_file_actions_t actions{};
+        posix_spawn_file_actions_init(&actions);
+        if (g_originalStdoutFd >= 0)
+            posix_spawn_file_actions_adddup2(&actions, g_originalStdoutFd, STDOUT_FILENO);
+        if (g_originalStderrFd >= 0)
+            posix_spawn_file_actions_adddup2(&actions, g_originalStderrFd, STDERR_FILENO);
+
         char** argv = *_NSGetArgv();
         pid_t child = 0;
-        return posix_spawn(&child, exePath.data(), nullptr, nullptr, argv, envPtrs.data()) == 0;
+        const int rc = posix_spawn(&child, exePath.data(), &actions, nullptr, argv, envPtrs.data());
+        posix_spawn_file_actions_destroy(&actions);
+        return rc == 0;
     }
 }
 
