@@ -150,9 +150,19 @@ skipped_fns="$(printf "%s\n" "$recomp_output" | grep -E "has unimplemented instr
 missing_syms="$(printf "%s\n" "$recomp_output" | grep "Found no symbol" || true)"
 missing_srcs="$(printf "%s\n" "$recomp_output" | grep "Unable to locate" || true)"
 
-if [[ $recomp_status -ne 0 || -n "$skipped_fns" || -n "$missing_syms" || -n "$missing_srcs" ]]; then
+covered_recomp_failures=()
+for op in "${COVERED[@]}"; do
+    op_skipped="$(printf "%s\n" "$recomp_output" | grep -E "in instr_${op} has unimplemented instructions|Found no symbol for test_${op}_" || true)"
+    if [[ -n "$op_skipped" ]]; then
+        covered_recomp_failures+=("$op_skipped")
+    fi
+done
+
+if [[ $recomp_status -ne 0 || -n "$missing_srcs" || ${#covered_recomp_failures[@]} -gt 0 || ( "$ALL" -eq 0 && ( -n "$skipped_fns" || -n "$missing_syms" ) ) ]]; then
     echo "Error: test recompilation failed or omitted tests during generation:" >&2
-    if [[ -n "$skipped_fns" ]]; then
+    if [[ ${#covered_recomp_failures[@]} -gt 0 ]]; then
+        printf "%s\n" "${covered_recomp_failures[@]}" | sed 's/^/  /' >&2
+    elif [[ -n "$skipped_fns" ]]; then
         printf "%s\n" "$skipped_fns" | sed 's/^/  /' >&2
     fi
     if [[ -n "$missing_syms" ]]; then
@@ -167,6 +177,14 @@ if [[ $recomp_status -ne 0 || -n "$skipped_fns" || -n "$missing_syms" || -n "$mi
     exit 1
 fi
 
+skipped_fn_count=0
+skipped_file_count=0
+if [[ "$ALL" -eq 1 && -n "$skipped_fns" ]]; then
+    skipped_fn_count="$(printf "%s\n" "$recomp_output" | grep -c "has unimplemented instructions" || true)"
+    skipped_file_count="$(printf "%s\n" "$recomp_output" | awk '/has unimplemented instructions/ {print $4}' | sort -u | wc -l | tr -d ' ')"
+    echo "    skipped $skipped_fn_count test functions across $skipped_file_count files (opcodes not used by CoD3)"
+fi
+
 if [[ ! -f "$HARNESS/main.cpp" ]]; then
     echo "Error: test harness main.cpp was not generated" >&2
     exit 1
@@ -178,14 +196,12 @@ if (( test_count == 0 )); then
     exit 1
 fi
 
-if [[ "$ALL" -eq 0 ]]; then
-    for op in "${COVERED[@]}"; do
-        if ! grep -qE "^\s*test_${op}_" "$HARNESS/main.cpp"; then
-            echo "Error: no tests generated for covered instruction $op" >&2
-            exit 1
-        fi
-    done
-fi
+for op in "${COVERED[@]}"; do
+    if ! grep -qE "^\s*test_${op}_" "$HARNESS/main.cpp"; then
+        echo "Error: no tests generated for covered instruction $op" >&2
+        exit 1
+    fi
+done
 
 echo "==> Building and running"
 cmake -S "$ROOT/tools/XenonRecomp" -B "$TOOL_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -212,8 +228,8 @@ if [[ -n "$failures" ]] || (( status != 0 )); then
 fi
 
 if [[ "$ALL" -eq 1 ]]; then
-    echo "Every check passed: all $test_count tests passed across $clean instruction test files."
-    echo "Intentional assembly skips: $problems tests (instructions the assembler cannot encode)."
+    echo "Every check passed: all $test_count recompiled tests passed across $clean assembled test files."
+    echo "Intentional skips: $problems files failed assembly (unsupported mnemonics), $skipped_fn_count functions across $skipped_file_count files skipped recompilation (unimplemented opcodes not used by CoD3)."
 else
     echo "Every check passed: all $test_count tests passed across ${#COVERED[@]} covered instructions."
 fi
