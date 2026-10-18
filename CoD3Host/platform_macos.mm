@@ -13,13 +13,88 @@
 #include <spawn.h>
 #include <sys/stat.h>
 
+#include <iterator>
+#include <map>
 #include <mutex>
-#include <unordered_map>
 
 namespace
 {
     std::mutex g_allocMutex;
-    std::unordered_map<uintptr_t, size_t> g_virtualAllocations;
+    // base -> size of every region VirtualAlloc reserved on its own.
+    std::map<uintptr_t, size_t> g_virtualAllocations;
+    // Committed host-page ranges [start, end), merged. Commitment is tracked
+    // here rather than inferred from PROT_NONE, because PAGE_NOACCESS memory
+    // can be committed and a reservation is not the same as a revoked page.
+    std::map<uintptr_t, uintptr_t> g_committed;
+
+    // g_allocMutex held for all of these.
+    bool FindAllocationLocked(uintptr_t address, uintptr_t& base, size_t& size)
+    {
+        auto it = g_virtualAllocations.upper_bound(address);
+        if (it == g_virtualAllocations.begin()) return false;
+        --it;
+        if (address >= it->first + it->second) return false;
+        base = it->first;
+        size = it->second;
+        return true;
+    }
+
+    bool IsCommittedLocked(uintptr_t address)
+    {
+        auto it = g_committed.upper_bound(address);
+        if (it == g_committed.begin()) return false;
+        --it;
+        return address < it->second;
+    }
+
+    // The end of the run of pages starting at address that share its state.
+    uintptr_t StateRunEndLocked(uintptr_t address, uintptr_t limit)
+    {
+        auto it = g_committed.upper_bound(address);
+        if (it != g_committed.begin())
+        {
+            auto prev = std::prev(it);
+            if (address < prev->second) return prev->second < limit ? prev->second : limit;
+        }
+        return (it != g_committed.end() && it->first < limit) ? it->first : limit;
+    }
+
+    void SetCommittedLocked(uintptr_t start, uintptr_t end, bool commit)
+    {
+        if (end <= start) return;
+
+        auto it = g_committed.lower_bound(start);
+        if (it != g_committed.begin())
+        {
+            auto prev = std::prev(it);
+            if (prev->second > start)
+            {
+                const uintptr_t prevEnd = prev->second;
+                prev->second = start;
+                if (prevEnd > end) g_committed[end] = prevEnd;
+            }
+        }
+        it = g_committed.lower_bound(start);
+        while (it != g_committed.end() && it->first < end)
+        {
+            const uintptr_t itEnd = it->second;
+            it = g_committed.erase(it);
+            if (itEnd > end) { g_committed[end] = itEnd; break; }
+        }
+
+        if (!commit) return;
+
+        uintptr_t newStart = start, newEnd = end;
+        it = g_committed.lower_bound(start);
+        if (it != g_committed.begin())
+        {
+            auto prev = std::prev(it);
+            if (prev->second == start) { newStart = prev->first; g_committed.erase(prev); }
+        }
+        it = g_committed.find(end);
+        if (it != g_committed.end()) { newEnd = it->second; g_committed.erase(it); }
+        g_committed[newStart] = newEnd;
+    }
 
     int WinProtToPosix(DWORD flProtect)
     {
@@ -99,8 +174,12 @@ BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)
 void* VirtualAlloc(void* lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect)
 {
     if (dwSize == 0) return nullptr;
+    const bool commit  = (flAllocationType & MEM_COMMIT) != 0;
+    const bool reserve = (flAllocationType & MEM_RESERVE) != 0;
+    if (!commit && !reserve) return nullptr;
+
     const size_t pageSize = HostPageSize();
-    const int prot = (flAllocationType & MEM_COMMIT) ? WinProtToPosix(flProtect) : PROT_NONE;
+    const int prot = commit ? WinProtToPosix(flProtect) : PROT_NONE;
 
     if (lpAddress == nullptr)
     {
@@ -109,7 +188,9 @@ void* VirtualAlloc(void* lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD
         if (mapped == MAP_FAILED) return nullptr;
         {
             std::lock_guard<std::mutex> lock(g_allocMutex);
-            g_virtualAllocations[reinterpret_cast<uintptr_t>(mapped)] = alignedSize;
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mapped);
+            g_virtualAllocations[base] = alignedSize;
+            SetCommittedLocked(base, base + alignedSize, commit);
         }
         return mapped;
     }
@@ -120,10 +201,40 @@ void* VirtualAlloc(void* lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD
     const uintptr_t alignedEnd   = (end + pageSize - 1) & ~(pageSize - 1);
     const size_t alignedSize     = alignedEnd - alignedStart;
 
-    if (flAllocationType & MEM_COMMIT)
+    if (reserve)
     {
-        if (mprotect(reinterpret_cast<void*>(alignedStart), alignedSize, prot) != 0)
+        // A fresh explicit-address reservation. The address is only a hint to
+        // mmap without MAP_FIXED, so nothing already mapped there is clobbered:
+        // if the kernel puts it anywhere else the range was not free, and the
+        // request fails as it does on Windows.
+        {
+            std::lock_guard<std::mutex> lock(g_allocMutex);
+            uintptr_t base = 0;
+            size_t size = 0;
+            if (FindAllocationLocked(alignedStart, base, size)) return nullptr;
+        }
+        void* mapped = mmap(reinterpret_cast<void*>(alignedStart), alignedSize, prot,
+                            MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (mapped == MAP_FAILED) return nullptr;
+        if (reinterpret_cast<uintptr_t>(mapped) != alignedStart)
+        {
+            munmap(mapped, alignedSize);
             return nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_allocMutex);
+            g_virtualAllocations[alignedStart] = alignedSize;
+            SetCommittedLocked(alignedStart, alignedEnd, commit);
+        }
+        return lpAddress;
+    }
+
+    // Commit only: the range is expected to be reserved already.
+    if (mprotect(reinterpret_cast<void*>(alignedStart), alignedSize, prot) != 0)
+        return nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_allocMutex);
+        SetCommittedLocked(alignedStart, alignedEnd, true);
     }
     return lpAddress;
 }
@@ -186,6 +297,10 @@ BOOL VirtualFree(void* lpAddress, SIZE_T dwSize, DWORD dwFreeType)
             releaseSize = (dwSize + pageSize - 1) & ~(pageSize - 1);
         if (releaseSize == 0)
             return FALSE;
+        {
+            std::lock_guard<std::mutex> lock(g_allocMutex);
+            SetCommittedLocked(start, start + releaseSize, false);
+        }
         return munmap(reinterpret_cast<void*>(start), releaseSize) == 0 ? TRUE : FALSE;
     }
 
@@ -197,6 +312,8 @@ BOOL VirtualFree(void* lpAddress, SIZE_T dwSize, DWORD dwFreeType)
         {
             madvise(reinterpret_cast<void*>(start), end - start, MADV_DONTNEED);
             mprotect(reinterpret_cast<void*>(start), end - start, PROT_NONE);
+            std::lock_guard<std::mutex> lock(g_allocMutex);
+            SetCommittedLocked(start, end, false);
         }
         return TRUE;
     }
@@ -246,9 +363,25 @@ SIZE_T VirtualQuery(const void* lpAddress, MEMORY_BASIC_INFORMATION* lpBuffer, S
     lpBuffer->AllocationBase    = reinterpret_cast<void*>(regionAddr);
     lpBuffer->AllocationProtect = winProt;
     lpBuffer->RegionSize        = static_cast<SIZE_T>((regionAddr + regionSize) - pageAlignedTarget);
-    // Pages reserved with PROT_NONE report MEM_RESERVE; pages committed with
-    // read/write/exec permissions report MEM_COMMIT.
-    lpBuffer->State             = (info.protection != VM_PROT_NONE) ? MEM_COMMIT : MEM_RESERVE;
+
+    // Commitment is tracked separately from protection: PAGE_NOACCESS memory
+    // can be committed, and changing protection never changes commitment.
+    // Memory VirtualAlloc did not reserve falls back on its protection.
+    DWORD state = (info.protection != VM_PROT_NONE) ? MEM_COMMIT : MEM_RESERVE;
+    {
+        std::lock_guard<std::mutex> lock(g_allocMutex);
+        uintptr_t allocBase = 0;
+        size_t allocSize = 0;
+        if (FindAllocationLocked(pageAlignedTarget, allocBase, allocSize))
+        {
+            state = IsCommittedLocked(pageAlignedTarget) ? MEM_COMMIT : MEM_RESERVE;
+            const uintptr_t limit = pageAlignedTarget + lpBuffer->RegionSize;
+            const uintptr_t runEnd = StateRunEndLocked(pageAlignedTarget, limit);
+            lpBuffer->RegionSize = static_cast<SIZE_T>(runEnd - pageAlignedTarget);
+            lpBuffer->AllocationBase = reinterpret_cast<void*>(allocBase);
+        }
+    }
+    lpBuffer->State             = state;
     lpBuffer->Protect           = winProt;
     lpBuffer->Type              = MEM_PRIVATE;
     return sizeof(MEMORY_BASIC_INFORMATION);
