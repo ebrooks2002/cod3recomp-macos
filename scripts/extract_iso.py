@@ -114,6 +114,21 @@ class XDvdFsImage:
                 remaining -= len(chunk)
 
 
+def resolve_safe_dest(root: pathlib.Path, entry_path: str) -> pathlib.Path:
+    """Resolve an ISO entry path under root and reject any path traversal or symlink escape."""
+    resolved_root = root.resolve()
+    rel = pathlib.PurePosixPath(entry_path.replace("\\", "/"))
+    if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
+        raise ValueError(f"Refusing to extract unsafe ISO path: {entry_path!r}")
+    candidate = resolved_root.joinpath(*rel.parts)
+    resolved_dest = candidate.resolve()
+    if resolved_dest == resolved_root or not resolved_dest.is_relative_to(resolved_root):
+        raise ValueError(f"Refusing to extract path outside destination root: {entry_path!r}")
+    if candidate.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlink at destination: {entry_path!r}")
+    return resolved_dest
+
+
 def main():
     parser = argparse.ArgumentParser(description="Xbox 360 XDVDFS ISO utility")
     parser.add_argument("iso", type=pathlib.Path, help="Path to Xbox 360 .iso")
@@ -147,8 +162,9 @@ def main():
             return 1
 
         if args.extract_all:
+            root = args.extract_all.resolve()
             for i, e in enumerate(entries, 1):
-                dest = args.extract_all / e["path"]
+                dest = resolve_safe_dest(root, e["path"])
                 img.extract_file(e, dest)
                 print(f"\r  [{i}/{len(entries)}] {e['path']:<48}", end="", flush=True)
             print("\nDone.")
