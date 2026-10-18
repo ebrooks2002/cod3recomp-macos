@@ -5,7 +5,7 @@ submodule is checked out, before the tools are built:
 
     git submodule update --init tools/XenonRecomp
     git -C tools/XenonRecomp apply ../patches/XenonRecomp.patch
-    .\scripts\recompile.ps1 -BuildTools
+    ./scripts/recompile.sh --build-tools
 
 What it carries, oldest first:
 
