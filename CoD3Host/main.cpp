@@ -14,9 +14,11 @@
 #include <thread>
 #include <vector>
 
-#include <Windows.h>
+#include "platform.h"
+#ifdef _WIN32
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
+#endif
 
 namespace fs = std::filesystem;
 
@@ -24,10 +26,7 @@ namespace
 {
     fs::path ExecutableDirectory()
     {
-        wchar_t buffer[MAX_PATH * 4] = {};
-        const DWORD length = GetModuleFileNameW(nullptr, buffer, DWORD(std::size(buffer)));
-        if (length == 0) return fs::current_path();
-        return fs::path(buffer).parent_path();
+        return Platform::ExecutableDirectory();
     }
 
     void Banner()

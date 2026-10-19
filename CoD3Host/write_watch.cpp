@@ -6,11 +6,15 @@
 #include <cstdlib>
 #include <mutex>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+    constexpr uint32_t PageShift = 14;                      // 16 KB hardware pages on Apple Silicon
+#else
     constexpr uint32_t PageShift = 12;
+#endif
     constexpr uint32_t WindowSize = 0x20000000u;           // 512 MB of physical memory
     constexpr uint32_t Pages = WindowSize >> PageShift;
     constexpr uint32_t Windows[] = { 0xA0000000u, 0xC0000000u, 0xE0000000u };

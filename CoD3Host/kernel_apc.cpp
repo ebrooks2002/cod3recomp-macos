@@ -24,7 +24,7 @@
 #include <map>
 #include <mutex>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {

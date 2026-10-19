@@ -17,18 +17,26 @@
 #include <thread>
 
 #include <fcntl.h>
+#include "platform.h"
+#ifdef _WIN32
 #include <io.h>
-#include <Windows.h>
+#else
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace
 {
     std::atomic<bool> g_started{ false };
-    HANDLE g_readEnd = nullptr;   // the pipe's end the copier reads, to see it empty
 
     // A run prints its report every ten seconds, some tens of megabytes an
     // hour. Past this the file starts over: what is wanted from it is the
     // end, the minutes before a freeze and the watchdog's report after.
     constexpr uint64_t StartOverBytes = 64ull << 20;
+
+#ifdef _WIN32
+    HANDLE g_readEnd = nullptr;   // the pipe's end the copier reads, to see it empty
 
     void Copier(HANDLE readEnd, HANDLE file, HANDLE console)
     {
@@ -51,6 +59,31 @@ namespace
             if (console != nullptr) WriteFile(console, buffer, got, &written, nullptr);
         }
     }
+#else
+    int g_readEndFd = -1;
+
+    void CopierPosix(int readEnd, int fileFd, int consoleFd)
+    {
+        char buffer[8192];
+        uint64_t inFile = 0;
+        for (;;)
+        {
+            const ssize_t got = ::read(readEnd, buffer, sizeof(buffer));
+            if (got <= 0) break;
+            if (inFile + uint64_t(got) > StartOverBytes)
+            {
+                ::lseek(fileFd, 0, SEEK_SET);
+                (void)::ftruncate(fileFd, 0);
+                static const char note[] = "log: started over at 64 MB\n";
+                (void)::write(fileFd, note, sizeof(note) - 1);
+                inFile = sizeof(note) - 1;
+            }
+            (void)::write(fileFd, buffer, size_t(got));
+            inFile += uint64_t(got);
+            if (consoleFd >= 0) (void)::write(consoleFd, buffer, size_t(got));
+        }
+    }
+#endif
 }
 
 void Log::Start()
@@ -58,6 +91,7 @@ void Log::Start()
     const char* setting = getenv("COD3_LOG");
     if (setting != nullptr && strcmp(setting, "0") == 0) return;
 
+#ifdef _WIN32
     const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     const DWORD type = (out == nullptr || out == INVALID_HANDLE_VALUE) ? FILE_TYPE_UNKNOWN : GetFileType(out);
     // Already written to a file or a pipe: whoever started the run keeps it.
@@ -125,6 +159,74 @@ void Log::Start()
     std::thread(Copier, readEnd, file, console).detach();
     g_started.store(true);
     printf("log: %ls\n", path.c_str());
+#else
+    struct stat st{};
+    const bool hasStdout = (::fstat(STDOUT_FILENO, &st) == 0);
+    if (hasStdout && (S_ISREG(st.st_mode) || S_ISFIFO(st.st_mode))) return;
+
+    const bool hasStdin = (::fcntl(STDIN_FILENO, F_GETFD) != -1);
+    const bool hasStderr = (::fcntl(STDERR_FILENO, F_GETFD) != -1);
+    if (!hasStdin || !hasStdout || !hasStderr)
+    {
+        const int nullFd = ::open("/dev/null", O_RDWR);
+        if (nullFd < 0) return;
+        if (!hasStdin && nullFd != STDIN_FILENO) ::dup2(nullFd, STDIN_FILENO);
+        if (!hasStdout && nullFd != STDOUT_FILENO) ::dup2(nullFd, STDOUT_FILENO);
+        if (!hasStderr && nullFd != STDERR_FILENO) ::dup2(nullFd, STDERR_FILENO);
+        if (nullFd > STDERR_FILENO) ::close(nullFd);
+        if (!hasStdin) (void)freopen("/dev/null", "r", stdin);
+        if (!hasStdout) (void)freopen("/dev/null", "w", stdout);
+        if (!hasStderr) (void)freopen("/dev/null", "w", stderr);
+    }
+
+    const std::filesystem::path directory = Platform::ExecutableDirectory();
+    const std::filesystem::path path = setting != nullptr && setting[0] != 0 && strcmp(setting, "1") != 0
+        ? std::filesystem::path(setting) : directory / "CoD3.log";
+    std::error_code ignored;
+    std::filesystem::path previous = path;
+    previous.replace_filename(path.stem().string() + ".previous" + path.extension().string());
+    std::filesystem::rename(path, previous, ignored);
+
+    const int fileFd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+    if (fileFd < 0) return;
+
+    int consoleFd = -1;
+    if (hasStdout && S_ISCHR(st.st_mode))
+    {
+        consoleFd = ::dup(STDOUT_FILENO);
+        if (consoleFd >= 0) ::fcntl(consoleFd, F_SETFD, FD_CLOEXEC);
+    }
+
+    int pipeFds[2] = { -1, -1 };
+    if (::pipe(pipeFds) != 0)
+    {
+        if (consoleFd >= 0) ::close(consoleFd);
+        ::close(fileFd);
+        return;
+    }
+    ::fcntl(pipeFds[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(pipeFds[1], F_SETFD, FD_CLOEXEC);
+
+    const int origOutFd = (consoleFd >= 0) ? consoleFd : ::dup(STDOUT_FILENO);
+    const int origErrFd = ::dup(STDERR_FILENO);
+    if (origOutFd >= 0 && origOutFd != consoleFd) ::fcntl(origOutFd, F_SETFD, FD_CLOEXEC);
+    if (origErrFd >= 0) ::fcntl(origErrFd, F_SETFD, FD_CLOEXEC);
+    Platform::RecordOriginalStdioFds(origOutFd, origErrFd);
+
+    fflush(stdout);
+    fflush(stderr);
+    ::dup2(pipeFds[1], STDOUT_FILENO);
+    ::dup2(pipeFds[1], STDERR_FILENO);
+    ::close(pipeFds[1]);
+
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
+    g_readEndFd = pipeFds[0];
+    std::thread(CopierPosix, pipeFds[0], fileFd, consoleFd).detach();
+    g_started.store(true);
+    printf("log: %s\n", path.string().c_str());
+#endif
 }
 
 void Log::Finish()
@@ -134,12 +236,21 @@ void Log::Finish()
     fflush(stderr);
     // The copier takes what is in the pipe on its own; this only waits for
     // the pipe to come up empty, and never long enough to hold up an exit.
+#ifdef _WIN32
     for (int i = 0; i < 50; i++)
     {
         DWORD waiting = 0;
         if (!PeekNamedPipe(g_readEnd, nullptr, 0, nullptr, &waiting, nullptr) || waiting == 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+#else
+    for (int i = 0; i < 50; i++)
+    {
+        int waiting = 0;
+        if (g_readEndFd < 0 || ::ioctl(g_readEndFd, FIONREAD, &waiting) != 0 || waiting == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+#endif
     // What was read last may still be on its way to the file.
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
