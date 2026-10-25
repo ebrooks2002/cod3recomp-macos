@@ -383,6 +383,7 @@ namespace Guest
 
     bool Initialize(const char* xexPath);
     void Shutdown();
+    uint64_t DemandCommitted();
 
     inline uint8_t* Ptr(uint32_t guestAddress) { return Base + guestAddress; }
 

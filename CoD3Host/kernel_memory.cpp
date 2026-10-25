@@ -37,7 +37,11 @@ namespace
     constexpr uint32_t X_STATUS_NO_MEMORY             = 0xC0000017;
     constexpr uint32_t X_STATUS_INVALID_PARAMETER     = 0xC000000D;
 
+#ifdef __APPLE__
+    constexpr uint32_t SmallPage = 16u << 10;
+#else
     constexpr uint32_t SmallPage = 4u << 10;
+#endif
     constexpr uint32_t LargePage = 64u << 10;
 
     uint32_t Align(uint32_t value, uint32_t to) { return (value + to - 1) & ~(to - 1); }
@@ -458,6 +462,16 @@ bool Kernel::FreedMemoryTouched(uint32_t address)
     const bool inHeap = (address >= Guest::PhysicalHeapBase && address < Guest::PhysicalHeapLimit) ||
                         (address >= Guest::VirtualHeapBase && address < Guest::VirtualHeapLimit);
     if (!inHeap || InLiveRegion(address)) return false;
+    // Let the access through, at the page: the run goes on, as it did when
+    // freed memory kept its contents. A page that was never committed has
+    // no protection to change, and saying it had been let through then sent
+    // the access straight back to fault again, for ever: the hangs at a
+    // level's teardown and reload were threads stopped on one load. Such a
+    // page is left to the demand commit, which hands it out as zeros, as
+    // the console hands out a fresh page.
+    DWORD was = 0;
+    if (VirtualProtect(Guest::Ptr(address & ~(SmallPage - 1)), SmallPage, PAGE_READWRITE, &was) == FALSE)
+        return false;
     // The first few: whose the memory was, from the history.
     static int told = 0;
     if (told < 4)
@@ -470,15 +484,7 @@ bool Kernel::FreedMemoryTouched(uint32_t address)
                     event.address, event.size >> 10, event.from);
         printf("\n");
     }
-    // Let the access through, at the page: the run goes on, as it did when
-    // freed memory kept its contents. A page that was never committed has
-    // no protection to change, and saying it had been let through then sent
-    // the access straight back to fault again, for ever: the hangs at a
-    // level's teardown and reload were threads stopped on one load. Such a
-    // page is left to the demand commit, which hands it out as zeros, as
-    // the console hands out a fresh page.
-    DWORD was = 0;
-    return VirtualProtect(Guest::Ptr(address & ~0xFFFu), 0x1000, PAGE_READWRITE, &was) != FALSE;
+    return true;
 }
 
 void Kernel::ReportHeaps()

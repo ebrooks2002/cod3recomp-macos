@@ -785,6 +785,12 @@ namespace Platform
     // Relaunches the current executable with COD3_LAUNCHDATA pointing to launchDataFile.
     bool RelaunchProcess(const std::filesystem::path& launchDataFile);
 
+    // Registers an externally mapped guest address space reservation [base, base + size)
+    // and marks [base + committedOffset, base + committedOffset + committedSize)
+    // as initially committed in a lock-free, async-signal-safe bitmap.
+    void RegisterExternalReservation(void* base, size_t size, size_t committedOffset, size_t committedSize);
+    void UnregisterExternalReservation(void* base);
+
     inline int g_originalStdoutFd = -1;
     inline int g_originalStderrFd = -1;
 

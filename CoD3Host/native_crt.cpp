@@ -45,8 +45,14 @@ namespace
     }
 }
 
+#ifdef _WIN32
+#define NATIVE_MEMSET_IMP_DECL(name) extern "C" PPC_FUNC(__imp__##name)
+#else
+#define NATIVE_MEMSET_IMP_DECL(name) extern "C" __attribute__((weak)) void __imp__##name(PPCContext& ctx, uint8_t* base) { NativeMemset(ctx, base); }
+#endif
+
 #define NATIVE_MEMSET(name)                                  \
-    extern "C" PPC_FUNC(__imp__##name);                      \
+    NATIVE_MEMSET_IMP_DECL(name);                            \
     PPC_FUNC(name)                                           \
     {                                                        \
         if (TitleMemset()) { __imp__##name(ctx, base); return; } \

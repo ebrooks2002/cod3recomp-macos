@@ -13,6 +13,7 @@
 #include <spawn.h>
 #include <sys/stat.h>
 
+#include <atomic>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -26,6 +27,103 @@ namespace
     // here rather than inferred from PROT_NONE, because PAGE_NOACCESS memory
     // can be committed and a reservation is not the same as a revoked page.
     std::map<uintptr_t, uintptr_t> g_committed;
+
+    // Lock-free, async-signal-safe commitment bitmap for the 4 GB guest address
+    // space reservation [g_externalBase, g_externalBase + g_externalSize).
+    // 1 bit per 4 KB page across up to 4 GB = 1,048,576 bits = 16,384 uint64_t words (128 KB).
+    constexpr size_t ExternalPageShift = 12;
+    constexpr size_t ExternalMaxPages  = 0x100000000ULL >> ExternalPageShift;
+    constexpr size_t ExternalWords     = ExternalMaxPages / 64;
+    std::atomic<uintptr_t> g_externalBase{ 0 };
+    std::atomic<size_t>    g_externalSize{ 0 };
+    std::atomic<uint64_t>  g_externalCommitted[ExternalWords];
+
+    bool InExternalReservation(uintptr_t address, uintptr_t& extBase, size_t& extSize) noexcept
+    {
+        extBase = g_externalBase.load(std::memory_order_acquire);
+        extSize = g_externalSize.load(std::memory_order_acquire);
+        return extBase != 0 && address >= extBase && (address - extBase) < extSize;
+    }
+
+    bool IsExternalPageCommitted(uintptr_t extBase, uintptr_t address) noexcept
+    {
+        const size_t page = (address - extBase) >> ExternalPageShift;
+        if (page >= ExternalMaxPages) return false;
+        const uint64_t word = g_externalCommitted[page >> 6].load(std::memory_order_acquire);
+        return (word & (1ULL << (page & 63))) != 0;
+    }
+
+    bool IsExternalRangeCommitted(uintptr_t extBase, size_t extSize, uintptr_t start, uintptr_t end) noexcept
+    {
+        if (end <= start || start < extBase || (end - extBase) > extSize) return false;
+        const size_t firstPage = (start - extBase) >> ExternalPageShift;
+        const size_t lastPage  = (end - extBase) >> ExternalPageShift;
+        if (lastPage > ExternalMaxPages) return false;
+        size_t page = firstPage;
+        while (page < lastPage)
+        {
+            const size_t wordIdx = page >> 6;
+            const size_t bitOff  = page & 63;
+            const size_t rem     = lastPage - page;
+            const size_t bits    = (bitOff + rem <= 64) ? rem : (64 - bitOff);
+            const uint64_t mask  = (bits == 64) ? ~uint64_t(0) : (((1ULL << bits) - 1ULL) << bitOff);
+            if ((g_externalCommitted[wordIdx].load(std::memory_order_acquire) & mask) != mask)
+                return false;
+            page += bits;
+        }
+        return true;
+    }
+
+    void SetExternalCommitted(uintptr_t extBase, size_t extSize, uintptr_t start, uintptr_t end, bool commit) noexcept
+    {
+        if (end <= start || start < extBase) return;
+        const size_t firstPage = (start - extBase) >> ExternalPageShift;
+        size_t lastPage = (end - extBase) >> ExternalPageShift;
+        const size_t maxPages = (extSize >> ExternalPageShift) < ExternalMaxPages
+            ? (extSize >> ExternalPageShift)
+            : ExternalMaxPages;
+        if (lastPage > maxPages) lastPage = maxPages;
+        size_t page = firstPage;
+        while (page < lastPage)
+        {
+            const size_t wordIdx = page >> 6;
+            const size_t bitOff  = page & 63;
+            const size_t rem     = lastPage - page;
+            const size_t bits    = (bitOff + rem <= 64) ? rem : (64 - bitOff);
+            const uint64_t mask  = (bits == 64) ? ~uint64_t(0) : (((1ULL << bits) - 1ULL) << bitOff);
+            if (commit)
+                g_externalCommitted[wordIdx].fetch_or(mask, std::memory_order_release);
+            else
+                g_externalCommitted[wordIdx].fetch_and(~mask, std::memory_order_release);
+            page += bits;
+        }
+    }
+
+    uintptr_t ExternalStateRunEnd(uintptr_t extBase, size_t extSize, uintptr_t address, uintptr_t limit) noexcept
+    {
+        const uintptr_t extEnd = extBase + extSize;
+        if (limit > extEnd) limit = extEnd;
+        const bool targetState = IsExternalPageCommitted(extBase, address);
+        const size_t pageSize = 1ULL << ExternalPageShift;
+        uintptr_t cur = (address & ~(pageSize - 1)) + pageSize;
+        while (cur < limit)
+        {
+            const size_t page = (cur - extBase) >> ExternalPageShift;
+            if ((page & 63) == 0 && cur + (64 * pageSize) <= limit)
+            {
+                const uint64_t word = g_externalCommitted[page >> 6].load(std::memory_order_acquire);
+                if (word == (targetState ? ~uint64_t(0) : uint64_t(0)))
+                {
+                    cur += 64 * pageSize;
+                    continue;
+                }
+            }
+            if (IsExternalPageCommitted(extBase, cur) != targetState)
+                return cur;
+            cur += pageSize;
+        }
+        return limit;
+    }
 
     // g_allocMutex held for all of these.
     bool FindAllocationLocked(uintptr_t address, uintptr_t& base, size_t& size)
@@ -45,6 +143,15 @@ namespace
         if (it == g_committed.begin()) return false;
         --it;
         return address < it->second;
+    }
+
+    bool IsRangeCommittedLocked(uintptr_t start, uintptr_t end)
+    {
+        if (end <= start) return false;
+        auto it = g_committed.upper_bound(start);
+        if (it == g_committed.begin()) return false;
+        --it;
+        return end <= it->second;
     }
 
     // The end of the run of pages starting at address that share its state.
@@ -232,6 +339,14 @@ void* VirtualAlloc(void* lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD
     // Commit only: the range is expected to be reserved already.
     if (mprotect(reinterpret_cast<void*>(alignedStart), alignedSize, prot) != 0)
         return nullptr;
+
+    uintptr_t extBase = 0;
+    size_t extSize = 0;
+    if (InExternalReservation(alignedStart, extBase, extSize))
+    {
+        SetExternalCommitted(extBase, extSize, alignedStart, alignedEnd, true);
+    }
+    else
     {
         std::lock_guard<std::mutex> lock(g_allocMutex);
         SetCommittedLocked(alignedStart, alignedEnd, true);
@@ -243,6 +358,38 @@ BOOL VirtualProtect(void* lpAddress, SIZE_T dwSize, DWORD flNewProtect, DWORD* l
 {
     if (!lpAddress || dwSize == 0) return FALSE;
 
+    const size_t pageSize = HostPageSize();
+    const uintptr_t start = reinterpret_cast<uintptr_t>(lpAddress);
+    const uintptr_t end   = start + dwSize;
+    const uintptr_t alignedStart = start & ~(pageSize - 1);
+    const uintptr_t alignedEnd   = (end + pageSize - 1) & ~(pageSize - 1);
+    const int prot = WinProtToPosix(flNewProtect);
+
+    // Match Windows VirtualProtect semantics: changing protection on an
+    // uncommitted (MEM_RESERVE) page inside a tracked reservation fails.
+    uintptr_t extBase = 0;
+    size_t extSize = 0;
+    if (InExternalReservation(alignedStart, extBase, extSize))
+    {
+        if (!IsExternalRangeCommitted(extBase, extSize, alignedStart, alignedEnd))
+        {
+            errno = EINVAL;
+            return FALSE;
+        }
+    }
+    else
+    {
+        std::lock_guard<std::mutex> lock(g_allocMutex);
+        uintptr_t allocBase = 0;
+        size_t allocSize = 0;
+        if (FindAllocationLocked(alignedStart, allocBase, allocSize) &&
+            !IsRangeCommittedLocked(alignedStart, alignedEnd))
+        {
+            errno = EINVAL;
+            return FALSE;
+        }
+    }
+
     if (lpflOldProtect)
     {
         MEMORY_BASIC_INFORMATION mbi{};
@@ -251,11 +398,6 @@ BOOL VirtualProtect(void* lpAddress, SIZE_T dwSize, DWORD flNewProtect, DWORD* l
         else
             *lpflOldProtect = PAGE_READWRITE;
     }
-
-    const size_t pageSize = HostPageSize();
-    const uintptr_t start = reinterpret_cast<uintptr_t>(lpAddress);
-    const uintptr_t end   = start + dwSize;
-    const int prot = WinProtToPosix(flNewProtect);
 
     if (prot == PROT_NONE)
     {
@@ -270,8 +412,6 @@ BOOL VirtualProtect(void* lpAddress, SIZE_T dwSize, DWORD flNewProtect, DWORD* l
         return mprotect(reinterpret_cast<void*>(innerStart), innerEnd - innerStart, prot) == 0 ? TRUE : FALSE;
     }
 
-    const uintptr_t alignedStart = start & ~(pageSize - 1);
-    const uintptr_t alignedEnd   = (end + pageSize - 1) & ~(pageSize - 1);
     return mprotect(reinterpret_cast<void*>(alignedStart), alignedEnd - alignedStart, prot) == 0 ? TRUE : FALSE;
 }
 
@@ -312,8 +452,17 @@ BOOL VirtualFree(void* lpAddress, SIZE_T dwSize, DWORD dwFreeType)
         {
             madvise(reinterpret_cast<void*>(start), end - start, MADV_DONTNEED);
             mprotect(reinterpret_cast<void*>(start), end - start, PROT_NONE);
-            std::lock_guard<std::mutex> lock(g_allocMutex);
-            SetCommittedLocked(start, end, false);
+            uintptr_t extBase = 0;
+            size_t extSize = 0;
+            if (InExternalReservation(start, extBase, extSize))
+            {
+                SetExternalCommitted(extBase, extSize, start, end, false);
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lock(g_allocMutex);
+                SetCommittedLocked(start, end, false);
+            }
         }
         return TRUE;
     }
@@ -368,6 +517,17 @@ SIZE_T VirtualQuery(const void* lpAddress, MEMORY_BASIC_INFORMATION* lpBuffer, S
     // can be committed, and changing protection never changes commitment.
     // Memory VirtualAlloc did not reserve falls back on its protection.
     DWORD state = (info.protection != VM_PROT_NONE) ? MEM_COMMIT : MEM_RESERVE;
+    uintptr_t extBase = 0;
+    size_t extSize = 0;
+    if (InExternalReservation(pageAlignedTarget, extBase, extSize))
+    {
+        state = IsExternalPageCommitted(extBase, pageAlignedTarget) ? MEM_COMMIT : MEM_RESERVE;
+        const uintptr_t limit = pageAlignedTarget + lpBuffer->RegionSize;
+        const uintptr_t runEnd = ExternalStateRunEnd(extBase, extSize, pageAlignedTarget, limit);
+        lpBuffer->RegionSize = static_cast<SIZE_T>(runEnd - pageAlignedTarget);
+        lpBuffer->AllocationBase = reinterpret_cast<void*>(extBase);
+    }
+    else
     {
         std::lock_guard<std::mutex> lock(g_allocMutex);
         uintptr_t allocBase = 0;
@@ -841,6 +1001,181 @@ namespace Platform
         posix_spawn_file_actions_destroy(&actions);
         return rc == 0;
     }
+
+    void RegisterExternalReservation(void* base, size_t size, size_t committedOffset, size_t committedSize)
+    {
+        if (!base || size == 0) return;
+        for (size_t i = 0; i < ExternalWords; ++i)
+            g_externalCommitted[i].store(0, std::memory_order_relaxed);
+        const uintptr_t extBase = reinterpret_cast<uintptr_t>(base);
+        if (committedSize > 0 && committedOffset < size)
+        {
+            const size_t clampedSize = (committedOffset + committedSize <= size)
+                ? committedSize
+                : (size - committedOffset);
+            SetExternalCommitted(extBase, size,
+                                 extBase + committedOffset,
+                                 extBase + committedOffset + clampedSize,
+                                 true);
+        }
+        g_externalSize.store(size, std::memory_order_release);
+        g_externalBase.store(extBase, std::memory_order_release);
+    }
+
+    void UnregisterExternalReservation(void* base)
+    {
+        if (!base) return;
+        const uintptr_t extBase = reinterpret_cast<uintptr_t>(base);
+        if (g_externalBase.load(std::memory_order_acquire) == extBase)
+        {
+            g_externalBase.store(0, std::memory_order_release);
+            g_externalSize.store(0, std::memory_order_release);
+            for (size_t i = 0; i < ExternalWords; ++i)
+                g_externalCommitted[i].store(0, std::memory_order_relaxed);
+        }
+    }
+}
+
+// ============================================================================
+// Weak fallback stubs for Component 4–7 subsystems until their translation
+// units are enabled on macOS. Strong definitions in Component 4–7 automatically
+// override these weak symbols at link time.
+// ============================================================================
+#include "kernel.h"
+#include "coroutines.h"
+#include "sampler.h"
+#include "window.h"
+#include "input.h"
+#include "overlay.h"
+#include "audio_out.h"
+#include "xma.h"
+#include "render.h"
+#include "render_internal.h"
+#include "render_shaders.h"
+
+#define COD3_WEAK __attribute__((weak))
+
+COD3_WEAK PPC_FUNC(__imp__ExCreateThread)            { ctx.r3.u32 = 0; }
+COD3_WEAK PPC_FUNC(__imp__KeResumeThread)            { ctx.r3.u32 = 0; }
+COD3_WEAK PPC_FUNC(__imp__NtResumeThread)            { ctx.r3.u32 = 0; }
+COD3_WEAK PPC_FUNC(__imp__NtSuspendThread)           { ctx.r3.u32 = 0; }
+COD3_WEAK PPC_FUNC(__imp__ExTerminateThread)         { ctx.r3.u32 = 0; }
+COD3_WEAK PPC_FUNC(__imp__KeSetAffinityThread)       { ctx.r3.u32 = 1; }
+COD3_WEAK PPC_FUNC(__imp__KeSetBasePriorityThread)   { ctx.r3.u32 = 0; }
+
+namespace Guest
+{
+    COD3_WEAK uint32_t AllocateStack(uint32_t) { return StackBase; }
+}
+
+namespace Kernel
+{
+    COD3_WEAK void RegisterEntryThread() {}
+    COD3_WEAK uint32_t ThreadObjectFor(uint32_t) { return 0; }
+    COD3_WEAK std::string DescribeThreadHandle(uint32_t) { return {}; }
+    COD3_WEAK void ProfileHostThread(uint32_t, const char*, const char*) {}
+    COD3_WEAK void StartWatchdog() {}
+    COD3_WEAK void PrintHostStack(void*) {}
+    COD3_WEAK void WatchWrite(uint32_t, bool) {}
+    COD3_WEAK void ArmWatchpoints() {}
+    COD3_WEAK bool ReportWatchpoint(void*) { return false; }
+}
+
+namespace Coroutines
+{
+    COD3_WEAK void Begin(PPCContext& ctx, uint8_t* base, uint32_t, PPCFunc* entry) { if (entry) entry(ctx, base); }
+    COD3_WEAK void Resume(PPCContext&, uint8_t*, uint32_t) {}
+    COD3_WEAK bool YieldIfCoroutine(jmp_buf&, int) { return false; }
+    COD3_WEAK bool Finished(uint32_t) { return true; }
+    COD3_WEAK void Destroy(uint32_t) {}
+    COD3_WEAK bool Inside() { return false; }
+    COD3_WEAK void NewGeneration() {}
+}
+
+namespace Sampler
+{
+    COD3_WEAK uint32_t FunctionAt(unsigned long long) { return 0; }
+    COD3_WEAK int WalkGuestStack(void*, uint32_t*, int) { return 0; }
+    COD3_WEAK int FunctionsOnStack(uint32_t*, int) { return 0; }
+    COD3_WEAK void SampleNow() {}
+    COD3_WEAK bool ThreadTimesWanted() { return false; }
+    COD3_WEAK void ReportThreadTimes(const std::vector<std::pair<uint32_t, const char*>>&) {}
+    COD3_WEAK void Start(int) {}
+    COD3_WEAK void Stop() {}
+}
+
+namespace Window
+{
+    COD3_WEAK void Open() {}
+    COD3_WEAK void Close() {}
+    COD3_WEAK bool IsOpen() { return false; }
+    COD3_WEAK bool HasFocus() { return false; }
+    COD3_WEAK void* Handle() { return nullptr; }
+    COD3_WEAK void SetCursorHidden(bool) {}
+    COD3_WEAK void SetFrontBuffer(uint32_t, uint32_t, uint32_t) {}
+    COD3_WEAK bool TakeRawMouse(long& x, long& y) { x = 0; y = 0; return false; }
+    COD3_WEAK int TakeWheel() { return 0; }
+}
+
+namespace Input
+{
+    COD3_WEAK Pad State() { return Pad{}; }
+    COD3_WEAK uint16_t Buttons() { return 0; }
+    COD3_WEAK bool MouseHeld() { return false; }
+    COD3_WEAK uint32_t PacketNumber() { return 0; }
+    COD3_WEAK const char* KeyboardHelp() { return ""; }
+}
+
+namespace Overlay
+{
+    COD3_WEAK void NoteFrontEndText(FrontEndText) {}
+}
+
+namespace Audio
+{
+    COD3_WEAK bool Open() { return false; }
+    COD3_WEAK void Close() {}
+    COD3_WEAK bool SubmitFrame(uint32_t) { return true; }
+    COD3_WEAK void Report() {}
+}
+
+namespace Xma
+{
+    struct Stream {};
+    COD3_WEAK bool Available() { return false; }
+    COD3_WEAK const char* Unavailable() { return "not yet enabled"; }
+    COD3_WEAK Stream* Create(int, int) { return nullptr; }
+    COD3_WEAK void Destroy(Stream*) {}
+    COD3_WEAK bool Decode(Stream*, const uint8_t*, std::vector<int16_t>&) { return false; }
+    COD3_WEAK void Reset(Stream*) {}
+}
+
+namespace Render
+{
+    COD3_WEAK bool Enabled() { return false; }
+    COD3_WEAK void Draw(uint32_t, uint32_t, uint32_t) {}
+    COD3_WEAK void Resolve() {}
+    COD3_WEAK void ShaderLoaded(bool, uint32_t, uint32_t, uint32_t) {}
+    COD3_WEAK void UseProgram(bool, uint32_t, uint32_t, uint64_t) {}
+    COD3_WEAK void Swap(uint32_t, uint32_t, uint32_t) {}
+    COD3_WEAK void SetWindow(void*, int, int) {}
+    COD3_WEAK void PresentIdle() {}
+    COD3_WEAK void MemoryFreed(uint32_t, uint32_t) {}
+    COD3_WEAK uint64_t CurrentProgramHash(bool) { return 0; }
+    COD3_WEAK void LogNextFrame() {}
+    COD3_WEAK void Report() {}
+}
+
+namespace RenderInternal
+{
+    COD3_WEAK bool FrameLogged() { return false; }
+    COD3_WEAK uint64_t Swaps() { return 0; }
+    COD3_WEAK int DumpNumber() { return 0; }
+}
+
+namespace RenderShaders
+{
+    COD3_WEAK uint64_t HashMicrocode(const uint8_t*, uint32_t) { return 0; }
 }
 
 #endif // __APPLE__

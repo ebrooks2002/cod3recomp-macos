@@ -7,10 +7,14 @@
 #include <mutex>
 
 #include "platform.h"
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 namespace
 {
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+#ifdef __APPLE__
     constexpr uint32_t PageShift = 14;                      // 16 KB hardware pages on Apple Silicon
 #else
     constexpr uint32_t PageShift = 12;
@@ -29,9 +33,14 @@ namespace
         bool all = true;
         for (const uint32_t window : Windows)
         {
+#ifdef _WIN32
             DWORD was = 0;
+            DWORD* oldProt = &was;
+#else
+            DWORD* oldProt = nullptr;
+#endif
             if (!VirtualProtect(Guest::Base + window + (size_t(firstPage) << PageShift),
-                                size_t(count) << PageShift, protection, &was))
+                                size_t(count) << PageShift, protection, oldProt))
                 all = false;
         }
         return all;
@@ -139,7 +148,7 @@ void WriteWatch::Forget(uint32_t guestAddress, uint32_t bytes)
 
 bool WriteWatch::HandleFault(const void* hostAddress)
 {
-    if (!Enabled()) return false;
+    if (Guest::Base == nullptr || hostAddress < Guest::Base || !Enabled()) return false;
     const uintptr_t at = uintptr_t(hostAddress) - uintptr_t(Guest::Base);
     uint32_t page = Pages;
     for (const uint32_t window : Windows)
@@ -156,7 +165,23 @@ bool WriteWatch::HandleFault(const void* hostAddress)
     // Not armed: another thread disarmed it a moment ago, and the write goes
     // through when it is made again; or the page is protected for another
     // reason (freed memory), which is the other handlers' business.
+#ifdef __APPLE__
+    mach_vm_address_t regionAddr = reinterpret_cast<mach_vm_address_t>(hostAddress) & ~mach_vm_address_t((1u << PageShift) - 1);
+    mach_vm_size_t regionSize = 0;
+    vm_region_basic_info_data_64_t regionInfo{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t objectName = MACH_PORT_NULL;
+    const kern_return_t kr = mach_vm_region(
+        mach_task_self(), &regionAddr, &regionSize, VM_REGION_BASIC_INFO_64,
+        reinterpret_cast<vm_region_info_t>(&regionInfo), &count, &objectName);
+    if (objectName != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), objectName);
+    if (kr != KERN_SUCCESS || regionAddr > reinterpret_cast<mach_vm_address_t>(hostAddress))
+        return false;
+    return (regionInfo.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
+#else
     MEMORY_BASIC_INFORMATION info{};
     if (VirtualQuery(hostAddress, &info, sizeof(info)) == 0) return false;
     return info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE;
+#endif
 }
