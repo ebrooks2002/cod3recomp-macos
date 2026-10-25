@@ -6,7 +6,7 @@
 #include <mutex>
 #include <string>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {

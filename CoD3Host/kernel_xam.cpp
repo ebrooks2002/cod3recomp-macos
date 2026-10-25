@@ -25,7 +25,7 @@
 #include <algorithm>
 #include <cctype>
 
-#include <Windows.h>
+#include "platform.h"
 
 PPC_FUNC(__imp__NtSetEvent);
 
@@ -798,6 +798,7 @@ namespace
             fclose(out);
         }
 
+#ifdef _WIN32
         std::wstring environment;
         if (wchar_t* block = GetEnvironmentStringsW())
         {
@@ -829,6 +830,9 @@ namespace
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         return true;
+#else
+        return Platform::RelaunchProcess(file);
+#endif
     }
 }
 

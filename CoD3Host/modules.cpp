@@ -12,7 +12,7 @@
 #include <image.h>
 #include <xex.h>
 
-#include <Windows.h>
+#include "platform.h"
 
 // The function tables of the level libraries the build linked in.
 #define COD3_LEVEL(name) extern PPCFuncMapping PPCFuncMappings_##name[];

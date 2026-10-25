@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <string>
 
-#include <Windows.h>
+#include "platform.h"
 
 namespace
 {
