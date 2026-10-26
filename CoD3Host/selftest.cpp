@@ -104,6 +104,13 @@ namespace
         SELFTEST_CHECK(mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE,
             "Demand-committed block not MEM_COMMIT/PAGE_READWRITE (State=0x%X Protect=0x%X)",
             unsigned(mbi.State), unsigned(mbi.Protect));
+#ifndef _WIN32
+        size_t duplicateCommitBytes = 12345;
+        SELFTEST_CHECK(Platform::CommitExternalRange(Guest::Base + UncommittedBlock, 64u << 10, PAGE_READWRITE, duplicateCommitBytes) &&
+                       duplicateCommitBytes == 0,
+            "Expected 0 newly committed bytes on already-committed 64 KB block (got %zu)", duplicateCommitBytes);
+#endif
+        Kernel::FlushFaultDiagnostics();
         printf("  [PASS] 3. SIGBUS/SIGSEGV fault handler demand-committed 64 KB block at 0x%08X and resumed execution\n",
             UncommittedBlock);
 
@@ -219,6 +226,7 @@ namespace
         const uint32_t freedVal = Guest::Read32(Guest::Base, physAddr + 0x40u);
         SELFTEST_CHECK(freedVal == 0x42424242u,
             "FreedMemoryTouched fault recovery read 0x%08X, expected 0x42424242", freedVal);
+        Kernel::FlushFaultDiagnostics();
         printf("  [PASS] 5. SmallPage (%u KB), PROT_NONE freed-memory guard & FreedMemoryTouched recovery verified\n",
             virtSize >> 10);
 

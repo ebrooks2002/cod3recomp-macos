@@ -277,6 +277,8 @@ namespace Kernel
     // freed memory being read or written. True when it was, and the page
     // has been made accessible so the guest goes on.
     bool FreedMemoryTouched(uint32_t address);
+    void PrintFreedMemoryHistory(uint32_t address);
+    void FlushFaultDiagnostics();
     void ReportXma();   // the codec contexts, in the periodic report
 }
 

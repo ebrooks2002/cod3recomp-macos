@@ -74,15 +74,16 @@ namespace
         return true;
     }
 
-    void SetExternalCommitted(uintptr_t extBase, size_t extSize, uintptr_t start, uintptr_t end, bool commit) noexcept
+    size_t SetExternalCommitted(uintptr_t extBase, size_t extSize, uintptr_t start, uintptr_t end, bool commit) noexcept
     {
-        if (end <= start || start < extBase) return;
+        if (end <= start || start < extBase) return 0;
         const size_t firstPage = (start - extBase) >> ExternalPageShift;
         size_t lastPage = (end - extBase) >> ExternalPageShift;
         const size_t maxPages = (extSize >> ExternalPageShift) < ExternalMaxPages
             ? (extSize >> ExternalPageShift)
             : ExternalMaxPages;
         if (lastPage > maxPages) lastPage = maxPages;
+        size_t newlyTransitionedPages = 0;
         size_t page = firstPage;
         while (page < lastPage)
         {
@@ -92,11 +93,18 @@ namespace
             const size_t bits    = (bitOff + rem <= 64) ? rem : (64 - bitOff);
             const uint64_t mask  = (bits == 64) ? ~uint64_t(0) : (((1ULL << bits) - 1ULL) << bitOff);
             if (commit)
-                g_externalCommitted[wordIdx].fetch_or(mask, std::memory_order_release);
+            {
+                const uint64_t prev = g_externalCommitted[wordIdx].fetch_or(mask, std::memory_order_acq_rel);
+                newlyTransitionedPages += static_cast<size_t>(__builtin_popcountll((~prev) & mask));
+            }
             else
-                g_externalCommitted[wordIdx].fetch_and(~mask, std::memory_order_release);
+            {
+                const uint64_t prev = g_externalCommitted[wordIdx].fetch_and(~mask, std::memory_order_acq_rel);
+                newlyTransitionedPages += static_cast<size_t>(__builtin_popcountll(prev & mask));
+            }
             page += bits;
         }
+        return newlyTransitionedPages << ExternalPageShift;
     }
 
     uintptr_t ExternalStateRunEnd(uintptr_t extBase, size_t extSize, uintptr_t address, uintptr_t limit) noexcept
@@ -1033,6 +1041,41 @@ namespace Platform
             for (size_t i = 0; i < ExternalWords; ++i)
                 g_externalCommitted[i].store(0, std::memory_order_relaxed);
         }
+    }
+
+    bool CommitExternalRange(void* lpAddress, size_t dwSize, DWORD flProtect, size_t& outNewlyCommittedBytes) noexcept
+    {
+        outNewlyCommittedBytes = 0;
+        if (!lpAddress || dwSize == 0) return false;
+        const size_t pageSize = HostPageSize();
+        const uintptr_t start = reinterpret_cast<uintptr_t>(lpAddress);
+        const uintptr_t end   = start + dwSize;
+        const uintptr_t alignedStart = start & ~(pageSize - 1);
+        const uintptr_t alignedEnd   = (end + pageSize - 1) & ~(pageSize - 1);
+        const size_t alignedSize     = alignedEnd - alignedStart;
+
+        uintptr_t extBase = 0;
+        size_t extSize = 0;
+        if (!InExternalReservation(alignedStart, extBase, extSize))
+            return false;
+
+        const int prot = WinProtToPosix(flProtect);
+        if (mprotect(reinterpret_cast<void*>(alignedStart), alignedSize, prot) != 0)
+            return false;
+
+        outNewlyCommittedBytes = SetExternalCommitted(extBase, extSize, alignedStart, alignedEnd, true);
+        return true;
+    }
+
+    bool IsExternalAddressCommitted(const void* lpAddress) noexcept
+    {
+        if (!lpAddress) return false;
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(lpAddress);
+        uintptr_t extBase = 0;
+        size_t extSize = 0;
+        if (!InExternalReservation(addr, extBase, extSize))
+            return false;
+        return IsExternalPageCommitted(extBase, addr);
     }
 }
 

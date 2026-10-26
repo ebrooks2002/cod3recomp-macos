@@ -470,6 +470,90 @@ namespace
         return EXCEPTION_CONTINUE_SEARCH;
     }
 #else // !_WIN32 (macOS / POSIX)
+    bool g_rawFaultsWanted = false;
+    uintptr_t g_executableHeaderAddr = 0;
+
+    enum class FaultDiagKind : uint8_t
+    {
+        FreedMemory  = 1,
+        StrayHeap    = 2,
+        DemandCommit = 3,
+    };
+
+    struct FaultDiagSlot
+    {
+        std::atomic<uint32_t> state{ 0 }; // 0 = empty, 1 = writing/draining, 2 = ready
+        FaultDiagKind kind = FaultDiagKind::FreedMemory;
+        bool running = false;
+        ULONG_PTR accessType = 0;
+        uint32_t address = 0;
+        int funcCount = 0;
+        uint32_t functions[10] = {};
+    };
+
+    constexpr size_t FaultDiagCapacity = 64;
+    FaultDiagSlot g_faultDiagSlots[FaultDiagCapacity];
+    std::atomic<uint32_t> g_pendingFaultDiags{ 0 };
+
+    void RecordFaultDiagnostic(FaultDiagKind kind, ULONG_PTR accessType, uint32_t address,
+                               bool running, const uint32_t* functions, int funcCount) noexcept
+    {
+        for (size_t i = 0; i < FaultDiagCapacity; ++i)
+        {
+            uint32_t expected = 0;
+            if (g_faultDiagSlots[i].state.compare_exchange_strong(
+                    expected, 1u, std::memory_order_acq_rel, std::memory_order_relaxed))
+            {
+                g_faultDiagSlots[i].kind       = kind;
+                g_faultDiagSlots[i].running    = running;
+                g_faultDiagSlots[i].accessType = accessType;
+                g_faultDiagSlots[i].address    = address;
+                const int clamped = (funcCount < 0) ? 0 : (funcCount > 10 ? 10 : funcCount);
+                g_faultDiagSlots[i].funcCount  = clamped;
+                for (int f = 0; f < clamped; ++f)
+                    g_faultDiagSlots[i].functions[f] = functions[f];
+                g_faultDiagSlots[i].state.store(2u, std::memory_order_release);
+                g_pendingFaultDiags.fetch_add(1u, std::memory_order_release);
+                return;
+            }
+        }
+    }
+
+    void AppendSigStr(char* buf, size_t cap, size_t& len, const char* s) noexcept
+    {
+        while (*s != '\0' && len + 1 < cap)
+            buf[len++] = *s++;
+    }
+
+    void AppendSigHex(char* buf, size_t cap, size_t& len, uint64_t val, int minDigits) noexcept
+    {
+        char tmp[16];
+        int n = 0;
+        do
+        {
+            const unsigned d = unsigned(val & 0xFu);
+            tmp[n++] = char(d < 10 ? ('0' + d) : ('a' + (d - 10)));
+            val >>= 4;
+        } while (val != 0 && n < 16);
+        while (n < minDigits && n < 16)
+            tmp[n++] = '0';
+        while (n > 0 && len + 1 < cap)
+            buf[len++] = tmp[--n];
+    }
+
+    void AppendSigDec(char* buf, size_t cap, size_t& len, uint64_t val) noexcept
+    {
+        char tmp[20];
+        int n = 0;
+        do
+        {
+            tmp[n++] = char('0' + (val % 10));
+            val /= 10;
+        } while (val != 0 && n < 20);
+        while (n > 0 && len + 1 < cap)
+            buf[len++] = tmp[--n];
+    }
+
     void PosixFaultHandler(int sig, siginfo_t* info, void* uap)
     {
         auto* uc = static_cast<ucontext_t*>(uap);
@@ -510,27 +594,27 @@ namespace
         if ((sig == SIGBUS || sig == SIGSEGV) && isWrite && WriteWatch::HandleFault(faultAddr))
             return;
 
-        static const bool rawFaults = []() {
-            const char* text = getenv("COD3_RAWFAULTS");
-            return text != nullptr && text[0] != 0 && text[0] != '0';
-        }();
-        if (rawFaults && (sig == SIGBUS || sig == SIGSEGV))
+        if (g_rawFaultsWanted && (sig == SIGBUS || sig == SIGSEGV))
         {
             static std::atomic<int> raw{ 0 };
-            if (raw.fetch_add(1) < 400)
+            if (raw.fetch_add(1, std::memory_order_relaxed) < 400)
             {
-#ifdef __APPLE__
-                const uintptr_t exe = reinterpret_cast<uintptr_t>(_dyld_get_image_header(0));
-#else
-                const uintptr_t exe = 0;
-#endif
-                fprintf(stderr, "fault: sig %d kind %llu at %p (exe+%llx) address %p thread %lu unwinding %d guest ctx %p\n",
-                    sig, (unsigned long long)accessType,
-                    reinterpret_cast<void*>(context.Rip),
-                    (unsigned long long)(context.Rip - exe),
-                    faultAddr,
-                    (unsigned long)GetCurrentThreadId(), t_unwinding ? 1 : 0, (void*)Kernel::CurrentContext());
-                fprintf(stderr, "  rsp %p guest base %p\n", (void*)context.Rsp, (void*)Guest::Base);
+                char buf[256];
+                size_t len = 0;
+                AppendSigStr(buf, sizeof(buf), len, "fault: sig ");
+                AppendSigDec(buf, sizeof(buf), len, uint64_t(unsigned(sig)));
+                AppendSigStr(buf, sizeof(buf), len, " kind ");
+                AppendSigDec(buf, sizeof(buf), len, uint64_t(accessType));
+                AppendSigStr(buf, sizeof(buf), len, " at 0x");
+                AppendSigHex(buf, sizeof(buf), len, context.Rip, 1);
+                AppendSigStr(buf, sizeof(buf), len, " (exe+");
+                AppendSigHex(buf, sizeof(buf), len, context.Rip - g_executableHeaderAddr, 1);
+                AppendSigStr(buf, sizeof(buf), len, ") address 0x");
+                AppendSigHex(buf, sizeof(buf), len, reinterpret_cast<uintptr_t>(faultAddr), 1);
+                AppendSigStr(buf, sizeof(buf), len, " thread ");
+                AppendSigDec(buf, sizeof(buf), len, uint64_t(GetCurrentThreadId()));
+                AppendSigStr(buf, sizeof(buf), len, "\n");
+                (void)::write(STDERR_FILENO, buf, len);
             }
         }
 
@@ -653,80 +737,64 @@ namespace
         if (Kernel::FreedMemoryTouched(uint32_t(offset)))
         {
             static std::atomic<int> announced{ 0 };
-            if (announced.fetch_add(1) < 12)
+            if (announced.fetch_add(1, std::memory_order_relaxed) < 12)
             {
                 uint32_t functions[10] = {};
                 const int count = Sampler::WalkGuestStack(&context, functions, 10);
-                printf("memory: freed memory %s at 0x%08X;", AccessKind(accessType), uint32_t(offset));
-                if (count > 0)
-                {
-                    printf(" from");
-                    for (int i = 0; i < count; i++) printf(" sub_%08X", functions[i]);
-                }
-                printf("\n");
-                fflush(stdout);
+                RecordFaultDiagnostic(FaultDiagKind::FreedMemory, accessType, uint32_t(offset), false, functions, count);
             }
             return;
         }
 
-        {
+        auto RecordDemandCommitDiagnostics = [&](size_t newlyCommitted) noexcept {
+            if (newlyCommitted == 0)
+                return;
+
             const uint32_t guest = uint32_t(offset);
             const bool inHeap = (guest >= Guest::PhysicalHeapBase && guest < Guest::PhysicalHeapLimit) ||
                                 (guest >= Guest::VirtualHeapBase && guest < Guest::VirtualHeapLimit);
             static std::atomic<int> strays{ 0 };
-            if (inHeap && strays.fetch_add(1) < 16)
+            if (inHeap && strays.fetch_add(1, std::memory_order_relaxed) < 16)
             {
                 uint32_t functions[10] = {};
                 const int count = Sampler::WalkGuestStack(&context, functions, 10);
-                printf("memory: %s of heap memory never handed out, at 0x%08X;", AccessKind(accessType), guest);
-                if (count > 0)
-                {
-                    printf(" from");
-                    for (int i = 0; i < count; i++) printf(" sub_%08X", functions[i]);
-                }
-                printf("\n");
-                fflush(stdout);
+                RecordFaultDiagnostic(FaultDiagKind::StrayHeap, accessType, guest, false, functions, count);
             }
-        }
 
-        {
             static std::atomic<int> announced{ 0 };
-            const uint32_t guest = uint32_t(offset);
             const bool inImage = guest >= 0x82000000u && guest < uint32_t(Guest::FuncTableEnd);
             const bool inHeaps = (guest >= 0x3F000000u && guest < 0x70000000u);
             static std::atomic<int> runaway{ 0 };
-            const bool running = g_demandCommitted.load(std::memory_order_relaxed) > (256ull << 20) && runaway.fetch_add(1) < 12;
-            if ((!inImage && !inHeaps && announced.fetch_add(1) < 12) || running)
+            const bool running = g_demandCommitted.load(std::memory_order_relaxed) > (256ull << 20) &&
+                                 runaway.fetch_add(1, std::memory_order_relaxed) < 12;
+            if ((!inImage && !inHeaps && announced.fetch_add(1, std::memory_order_relaxed) < 12) || running)
             {
                 uint32_t functions[8] = {};
                 const int count = Sampler::WalkGuestStack(&context, functions, 8);
-                printf("commit: guest %s at 0x%08X, %s;",
-                    AccessKind(accessType), guest,
-                    running ? "with hundreds of megabytes already committed on demand" : "outside every allocation");
-                if (count > 0)
-                {
-                    printf(" from");
-                    for (int i = 0; i < count; i++) printf(" sub_%08X", functions[i]);
-                }
-                printf("\n");
-                fflush(stdout);
+                RecordFaultDiagnostic(FaultDiagKind::DemandCommit, accessType, guest, running, functions, count);
             }
-        }
+        };
 
-        if (g_demandCommitted.load(std::memory_order_relaxed) < DemandCommitLimit)
+        if (g_demandCommitted.load(std::memory_order_relaxed) < DemandCommitLimit ||
+            Platform::IsExternalAddressCommitted(Guest::Base + offset))
         {
-            if (VirtualAlloc(Guest::Base + block, DemandCommitGranularity,
-                             MEM_COMMIT, PAGE_READWRITE) != nullptr)
+            size_t newlyCommitted = 0;
+            if (Platform::CommitExternalRange(Guest::Base + block, DemandCommitGranularity,
+                                              PAGE_READWRITE, newlyCommitted))
             {
-                g_demandCommitted.fetch_add(DemandCommitGranularity, std::memory_order_relaxed);
+                RecordDemandCommitDiagnostics(newlyCommitted);
+                if (newlyCommitted > 0)
+                    g_demandCommitted.fetch_add(newlyCommitted, std::memory_order_relaxed);
                 return;
             }
 
             const uint64_t page = offset & ~(FallbackPageSize - 1);
-            if (VirtualAlloc(Guest::Base + page, FallbackPageSize,
-                             MEM_COMMIT, PAGE_READWRITE) != nullptr)
+            if (Platform::CommitExternalRange(Guest::Base + page, FallbackPageSize,
+                                              PAGE_READWRITE, newlyCommitted))
             {
-                g_demandCommitted.fetch_add(FallbackPageSize, std::memory_order_relaxed);
+                RecordDemandCommitDiagnostics(newlyCommitted);
+                if (newlyCommitted > 0)
+                    g_demandCommitted.fetch_add(newlyCommitted, std::memory_order_relaxed);
                 return;
             }
         }
@@ -1177,6 +1245,13 @@ bool Guest::Initialize(const char* xexPath)
     AddVectoredExceptionHandler(1, GuestFaultHandler);
     SetUnhandledExceptionFilter(LastChanceHandler);
 #else
+    {
+        const char* rawEnv = getenv("COD3_RAWFAULTS");
+        g_rawFaultsWanted = rawEnv != nullptr && rawEnv[0] != 0 && rawEnv[0] != '0';
+#ifdef __APPLE__
+        g_executableHeaderAddr = reinterpret_cast<uintptr_t>(_dyld_get_image_header(0));
+#endif
+    }
     struct sigaction sa{};
     sa.sa_sigaction = PosixFaultHandler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
@@ -1334,8 +1409,66 @@ bool Guest::Initialize(const char* xexPath)
 // get to do this: every other thread would then fault on memory that is no
 // longer there, each fault reported as one that could not be committed, and the
 // message that actually mattered scrolls away. Report and stop instead.
+void Kernel::FlushFaultDiagnostics()
+{
+#ifndef _WIN32
+    if (g_pendingFaultDiags.load(std::memory_order_acquire) == 0)
+        return;
+
+    bool printedAny = false;
+    for (size_t i = 0; i < FaultDiagCapacity; ++i)
+    {
+        uint32_t expected = 2u;
+        if (!g_faultDiagSlots[i].state.compare_exchange_strong(
+                expected, 1u, std::memory_order_acq_rel, std::memory_order_relaxed))
+        {
+            continue;
+        }
+
+        const FaultDiagKind kind      = g_faultDiagSlots[i].kind;
+        const bool          running   = g_faultDiagSlots[i].running;
+        const ULONG_PTR     access    = g_faultDiagSlots[i].accessType;
+        const uint32_t      address   = g_faultDiagSlots[i].address;
+        const int           funcCount = g_faultDiagSlots[i].funcCount;
+        uint32_t            functions[10] = {};
+        for (int f = 0; f < funcCount && f < 10; ++f)
+            functions[f] = g_faultDiagSlots[i].functions[f];
+
+        g_faultDiagSlots[i].state.store(0u, std::memory_order_release);
+        g_pendingFaultDiags.fetch_sub(1u, std::memory_order_release);
+
+        if (kind == FaultDiagKind::FreedMemory)
+        {
+            Kernel::PrintFreedMemoryHistory(address);
+            printf("memory: freed memory %s at 0x%08X;", AccessKind(access), address);
+        }
+        else if (kind == FaultDiagKind::StrayHeap)
+        {
+            printf("memory: %s of heap memory never handed out, at 0x%08X;", AccessKind(access), address);
+        }
+        else
+        {
+            printf("commit: guest %s at 0x%08X, %s;",
+                AccessKind(access), address,
+                running ? "with hundreds of megabytes already committed on demand" : "outside every allocation");
+        }
+        if (funcCount > 0)
+        {
+            printf(" from");
+            for (int f = 0; f < funcCount; ++f)
+                printf(" sub_%08X", functions[f]);
+        }
+        printf("\n");
+        printedAny = true;
+    }
+    if (printedAny)
+        fflush(stdout);
+#endif
+}
+
 void Guest::Shutdown()
 {
+    Kernel::FlushFaultDiagnostics();
     if (g_reservation != nullptr)
     {
 #ifdef _WIN32
@@ -1473,6 +1606,7 @@ void Kernel::StartKernelTrace()
 
 void Kernel::CountImportOn(const char* name, uint32_t subject)
 {
+    FlushFaultDiagnostics();
     if (g_kernelTraceLeft.load(std::memory_order_relaxed) > 0 &&
         strstr(name, "CriticalSection") == nullptr &&   // thousands a second, all alike
         !(subject == 0x100 && (name[2] == 'W' || name[2] == 'R')) &&   // the job lock, polled

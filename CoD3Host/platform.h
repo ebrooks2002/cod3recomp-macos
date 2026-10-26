@@ -791,6 +791,14 @@ namespace Platform
     void RegisterExternalReservation(void* base, size_t size, size_t committedOffset, size_t committedSize);
     void UnregisterExternalReservation(void* base);
 
+    // Commits [lpAddress, lpAddress + dwSize) inside the registered external
+    // reservation and returns true if mprotect succeeded. outNewlyCommittedBytes
+    // receives only the bytes that atomically transitioned from uncommitted to
+    // committed on this call, preventing concurrent fault handlers from
+    // double-counting overlapping demand commits.
+    bool CommitExternalRange(void* lpAddress, size_t dwSize, DWORD flProtect, size_t& outNewlyCommittedBytes) noexcept;
+    bool IsExternalAddressCommitted(const void* lpAddress) noexcept;
+
     inline int g_originalStdoutFd = -1;
     inline int g_originalStderrFd = -1;
 
