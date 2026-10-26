@@ -160,6 +160,27 @@ namespace
             "Expected 16 KB SmallPage allocation on macOS (got addr=0x%08X size=%u)", virtAddr, virtSize);
 #endif
 
+        // Reserve-only (X_MEM_RESERVE without X_MEM_COMMIT) followed by NtFreeVirtualMemory(X_MEM_DECOMMIT):
+        // verifies that zeroing an untouched reserved allocation while holding g_allocatorMutex
+        // demand-commits lock-free without deadlocking in Kernel::FreedMemoryTouched.
+        ctx = PPCContext{};
+        Guest::Write32(Guest::Base, ScratchParams + 0, 0u);
+        Guest::Write32(Guest::Base, ScratchParams + 4, 64u << 10);
+        ctx.r3.u32 = ScratchParams + 0;
+        ctx.r4.u32 = ScratchParams + 4;
+        ctx.r5.u32 = 0x00002000u;                                  // X_MEM_RESERVE only
+        __imp__NtAllocateVirtualMemory(ctx, Guest::Base);
+        SELFTEST_CHECK(ctx.r3.u32 == 0, "NtAllocateVirtualMemory(X_MEM_RESERVE) failed with status 0x%08X", ctx.r3.u32);
+        const uint32_t reservedOnlyAddr = Guest::Read32(Guest::Base, ScratchParams + 0);
+
+        ctx = PPCContext{};
+        ctx.r3.u32 = ScratchParams + 0;
+        ctx.r4.u32 = ScratchParams + 4;
+        ctx.r5.u32 = 0x00004000u;                                  // X_MEM_DECOMMIT
+        __imp__NtFreeVirtualMemory(ctx, Guest::Base);
+        SELFTEST_CHECK(ctx.r3.u32 == 0 && Guest::Read32(Guest::Base, reservedOnlyAddr) == 0,
+            "NtFreeVirtualMemory(X_MEM_DECOMMIT) on reserved-only region failed");
+
         // Allocate physical memory via MmAllocatePhysicalMemoryEx, free it via MmFreePhysicalMemory,
         // verify PROT_NONE guard and MmQueryAddressProtect == 0, then verify FreedMemoryTouched fault recovery.
         ctx = PPCContext{};
