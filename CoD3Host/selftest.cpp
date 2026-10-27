@@ -109,6 +109,11 @@ namespace
         SELFTEST_CHECK(Platform::CommitExternalRange(Guest::Base + UncommittedBlock, 64u << 10, PAGE_READWRITE, duplicateCommitBytes) &&
                        duplicateCommitBytes == 0,
             "Expected 0 newly committed bytes on already-committed 64 KB block (got %zu)", duplicateCommitBytes);
+
+        size_t outOfBoundsBytes = 12345;
+        SELFTEST_CHECK(!Platform::CommitExternalRange(Guest::Base + Guest::TotalSize - (16u << 10), 32u << 10, PAGE_READWRITE, outOfBoundsBytes) &&
+                       outOfBoundsBytes == 0,
+            "Expected CommitExternalRange straddling end of 4 GB reservation to be rejected");
 #endif
         Kernel::FlushFaultDiagnostics();
         printf("  [PASS] 3. SIGBUS/SIGSEGV fault handler demand-committed 64 KB block at 0x%08X and resumed execution\n",
@@ -247,17 +252,13 @@ namespace SelfTest
             if (rc != 0 || suite == "vm")
                 return rc;
         }
-        if (suite == "runtime" || suite == "render" || suite == "audio")
+        if (suite == "runtime" || suite == "render" || suite == "audio" || suite == "all")
         {
             fprintf(stderr, "Self-test suite '%s' is not implemented yet.\n", suite.c_str());
             return 1;
         }
-        if (suite != "vm" && suite != "all")
-        {
-            fprintf(stderr, "Unknown self-test suite '%s' (expected vm, runtime, render, audio, or all).\n",
-                suite.c_str());
-            return 1;
-        }
-        return 0;
+        fprintf(stderr, "Unknown self-test suite '%s' (expected vm, runtime, render, audio, or all).\n",
+            suite.c_str());
+        return 1;
     }
 }

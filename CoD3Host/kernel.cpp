@@ -562,6 +562,7 @@ namespace
         CONTEXT context{};
         context.ContextFlags = CONTEXT_FULL;
         bool isWrite = false;
+        bool isNonRecoverableDataFault = false;
         ULONG_PTR accessType = 0;
         if (uc != nullptr && uc->uc_mcontext != nullptr)
         {
@@ -577,21 +578,30 @@ namespace
             // Bit 6 (WnR) of ARM64 ESR_EL1 is 1 on a write fault, 0 on a read fault.
             const uint64_t esr = uc->uc_mcontext->__es.__esr;
             const uint32_t ec  = (esr >> 26) & 0x3Fu;
-            isWrite    = (esr & (1u << 6)) != 0;
-            accessType = (ec == 0x20 || ec == 0x21) ? 8 : (isWrite ? 1 : 0);
+            const uint32_t dfsc = esr & 0x3Fu;
+            const bool isInstAbort = (ec == 0x20 || ec == 0x21);
+            const bool isDataAbort = (ec == 0x24 || ec == 0x25);
+            const bool isAlignmentFault = (ec == 0x22 || ec == 0x26) || (isDataAbort && dfsc == 0x21u);
+            isWrite    = isDataAbort && !isAlignmentFault && ((esr & (1u << 6)) != 0);
+            accessType = isInstAbort ? 8 : (isWrite ? 1 : 0);
+            isNonRecoverableDataFault = isInstAbort || isAlignmentFault || !isDataAbort;
 #elif defined(__x86_64__)
             context.Rip = uc->uc_mcontext->__ss.__rip;
             context.Rsp = uc->uc_mcontext->__ss.__rsp;
             context.Rbp = uc->uc_mcontext->__ss.__rbp;
             const uint64_t err = uc->uc_mcontext->__es.__err;
-            isWrite    = (err & (1u << 1)) != 0;
-            accessType = (err & (1u << 4)) ? 8 : (isWrite ? 1 : 0);
+            const bool isInstFetch = (err & (1u << 4)) != 0;
+            const bool isAlignFault = (sig == SIGBUS && info != nullptr && info->si_code == BUS_ADRALN);
+            isWrite    = !isInstFetch && !isAlignFault && ((err & (1u << 1)) != 0);
+            accessType = isInstFetch ? 8 : (isWrite ? 1 : 0);
+            isNonRecoverableDataFault = isInstFetch || isAlignFault;
 #endif
         }
 
         // A write to a page the renderer watches (write_watch.cpp): noted,
         // the page made writable, and the write made again.
-        if ((sig == SIGBUS || sig == SIGSEGV) && isWrite && WriteWatch::HandleFault(faultAddr))
+        if ((sig == SIGBUS || sig == SIGSEGV) && !isNonRecoverableDataFault && isWrite &&
+            WriteWatch::HandleFault(faultAddr))
             return;
 
         if (g_rawFaultsWanted && (sig == SIGBUS || sig == SIGSEGV))
@@ -629,10 +639,11 @@ namespace
             if (Kernel::ReportWatchpoint(&context))
                 return;
             signal(sig, SIG_DFL);
+            raise(sig);
             return;
         }
 
-        if ((sig != SIGBUS && sig != SIGSEGV) || Guest::Base == nullptr)
+        if ((sig != SIGBUS && sig != SIGSEGV) || Guest::Base == nullptr || isNonRecoverableDataFault)
         {
             static std::atomic<int> announced{ 0 };
             if (announced.fetch_add(1) < 4)
@@ -1248,6 +1259,7 @@ bool Guest::Initialize(const char* xexPath)
     {
         const char* rawEnv = getenv("COD3_RAWFAULTS");
         g_rawFaultsWanted = rawEnv != nullptr && rawEnv[0] != 0 && rawEnv[0] != '0';
+        (void)WriteWatch::Enabled();
 #ifdef __APPLE__
         g_executableHeaderAddr = reinterpret_cast<uintptr_t>(_dyld_get_image_header(0));
 #endif

@@ -311,9 +311,12 @@ void* VirtualAlloc(void* lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD
     }
 
     const uintptr_t start = reinterpret_cast<uintptr_t>(lpAddress);
+    if (dwSize > ~uintptr_t(0) - start) return nullptr;
     const uintptr_t end   = start + dwSize;
+    if (end > ~uintptr_t(0) - (pageSize - 1)) return nullptr;
     const uintptr_t alignedStart = start & ~(pageSize - 1);
     const uintptr_t alignedEnd   = (end + pageSize - 1) & ~(pageSize - 1);
+    if (alignedEnd <= alignedStart) return nullptr;
     const size_t alignedSize     = alignedEnd - alignedStart;
 
     if (reserve)
@@ -345,12 +348,16 @@ void* VirtualAlloc(void* lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD
     }
 
     // Commit only: the range is expected to be reserved already.
+    uintptr_t extBase = 0;
+    size_t extSize = 0;
+    const bool inExt = InExternalReservation(alignedStart, extBase, extSize);
+    if (inExt && (alignedEnd - extBase) > extSize)
+        return nullptr;
+
     if (mprotect(reinterpret_cast<void*>(alignedStart), alignedSize, prot) != 0)
         return nullptr;
 
-    uintptr_t extBase = 0;
-    size_t extSize = 0;
-    if (InExternalReservation(alignedStart, extBase, extSize))
+    if (inExt)
     {
         SetExternalCommitted(extBase, extSize, alignedStart, alignedEnd, true);
     }
@@ -1049,14 +1056,18 @@ namespace Platform
         if (!lpAddress || dwSize == 0) return false;
         const size_t pageSize = HostPageSize();
         const uintptr_t start = reinterpret_cast<uintptr_t>(lpAddress);
+        if (dwSize > ~uintptr_t(0) - start) return false;
         const uintptr_t end   = start + dwSize;
+        if (end > ~uintptr_t(0) - (pageSize - 1)) return false;
         const uintptr_t alignedStart = start & ~(pageSize - 1);
         const uintptr_t alignedEnd   = (end + pageSize - 1) & ~(pageSize - 1);
+        if (alignedEnd <= alignedStart) return false;
         const size_t alignedSize     = alignedEnd - alignedStart;
 
         uintptr_t extBase = 0;
         size_t extSize = 0;
-        if (!InExternalReservation(alignedStart, extBase, extSize))
+        if (!InExternalReservation(alignedStart, extBase, extSize) ||
+            (alignedEnd - extBase) > extSize)
             return false;
 
         const int prot = WinProtToPosix(flProtect);

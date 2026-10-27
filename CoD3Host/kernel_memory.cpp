@@ -173,9 +173,9 @@ namespace
     {
         if (size == 0) return;
         WriteWatch::Forget(address, size);
+        SetFreedPages(address, size, true);
         DWORD was = 0;
         VirtualProtect(Guest::Ptr(address), size, PAGE_NOACCESS, &was);
-        SetFreedPages(address, size, true);
         std::map<uint32_t, uint32_t>& list = FreeList(physical);
         std::map<uint32_t, uint64_t>& times = FreedAt(physical);
         const uint64_t now = GetTickCount64();
@@ -565,7 +565,6 @@ bool Kernel::FreedMemoryTouched(uint32_t address)
         ClearFreedPage(address);
         return false;
     }
-    ClearFreedPage(address);
 #ifdef _WIN32
     PrintFreedMemoryHistory(address);
 #endif
