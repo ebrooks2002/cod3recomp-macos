@@ -17,7 +17,13 @@
 #include <cstring>
 #include <vector>
 
-#include <Windows.h>
+#include "platform.h"
+#ifndef _WIN32
+#include <sys/ucontext.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#endif
 
 #include <file.h>
 #include <image.h>
@@ -33,8 +39,12 @@ namespace Guest
 namespace
 {
     void* g_reservation = nullptr;
+#ifdef _WIN32
     HANDLE g_physicalSection = nullptr;   // the 512 MB behind the three physical windows
-    uint64_t g_demandCommitted = 0;
+#else
+    size_t g_reservationSize = 0;
+#endif
+    std::atomic<uint64_t> g_demandCommitted{ 0 };
 
     // Guest memory is reserved in one block but committed lazily. The title
     // allocates through kernel calls that do not exist yet, so there is no way
@@ -49,6 +59,12 @@ namespace
     // several times what the title thinks it is using.
     constexpr uint64_t DemandCommitLimit = 2048ull << 20;
 
+#ifdef __APPLE__
+    constexpr uint64_t FallbackPageSize = 16u << 10;
+#else
+    constexpr uint64_t FallbackPageSize = 4u << 10;
+#endif
+
     const char* AccessKind(ULONG_PTR type)
     {
         switch (type)
@@ -62,6 +78,7 @@ namespace
 
     thread_local bool t_unwinding = false;
 
+#ifdef _WIN32
     // What nothing else handled: the exception that is about to end the
     // process, said out loud with its host frames, on the unbuffered stream.
     LONG CALLBACK LastChanceHandler(EXCEPTION_POINTERS* info)
@@ -72,7 +89,7 @@ namespace
             record->ExceptionCode, record->ExceptionAddress,
             (unsigned long long)(uintptr_t(record->ExceptionAddress) - exe),
             (unsigned long long)record->ExceptionInformation[0],
-            (void*)record->ExceptionInformation[1], GetCurrentThreadId());
+            (void*)record->ExceptionInformation[1], (unsigned long)GetCurrentThreadId());
         CONTEXT walk = *info->ContextRecord;
         fprintf(stderr, "  frames:");
         for (int depth = 0; depth < 24; depth++)
@@ -120,7 +137,7 @@ namespace
                     record->ExceptionAddress,
                     (unsigned long long)(uintptr_t(record->ExceptionAddress) - uintptr_t(GetModuleHandleW(nullptr))),
                     (void*)record->ExceptionInformation[1],
-                    GetCurrentThreadId(), t_unwinding ? 1 : 0, (void*)Kernel::CurrentContext());
+                    (unsigned long)GetCurrentThreadId(), t_unwinding ? 1 : 0, (void*)Kernel::CurrentContext());
                 // The host frames, exe relative, unwound without dbghelp.
                 CONTEXT walk = *info->ContextRecord;
                 const uintptr_t exe = uintptr_t(GetModuleHandleW(nullptr));
@@ -328,7 +345,7 @@ namespace
                 printf("  code address that has no recompiled function behind it.\n");
             }
             printf("  %.1f MB of guest memory had been committed on demand.\n",
-                g_demandCommitted / 1048576.0);
+                g_demandCommitted.load(std::memory_order_relaxed) / 1048576.0);
             Kernel::PrintHostStack(info->ContextRecord);
             fflush(stdout);
             return EXCEPTION_CONTINUE_SEARCH;
@@ -401,7 +418,7 @@ namespace
             // A run through memory: hundreds of megabytes committed on demand
             // is a pointer gone wild, and the thread it is on is named.
             static std::atomic<int> runaway{ 0 };
-            const bool running = g_demandCommitted > (256ull << 20) && runaway.fetch_add(1) < 12;
+            const bool running = g_demandCommitted.load(std::memory_order_relaxed) > (256ull << 20) && runaway.fetch_add(1) < 12;
             if ((!inImage && !inHeaps && announced.fetch_add(1) < 12) || running)
             {
                 uint32_t functions[8] = {};
@@ -419,7 +436,7 @@ namespace
             }
         }
 
-        if (g_demandCommitted < DemandCommitLimit)
+        if (g_demandCommitted.load(std::memory_order_relaxed) < DemandCommitLimit)
         {
             // Sixty four kilobytes at a time, because that is the granularity
             // the console hands memory out in and it keeps the number of
@@ -429,15 +446,15 @@ namespace
             if (VirtualAlloc(Guest::Base + block, DemandCommitGranularity,
                              MEM_COMMIT, PAGE_READWRITE) != nullptr)
             {
-                g_demandCommitted += DemandCommitGranularity;
+                g_demandCommitted.fetch_add(DemandCommitGranularity, std::memory_order_relaxed);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
-            const uint64_t page = offset & ~uint64_t(0xFFF);
-            if (VirtualAlloc(Guest::Base + page, 0x1000,
+            const uint64_t page = offset & ~(FallbackPageSize - 1);
+            if (VirtualAlloc(Guest::Base + page, FallbackPageSize,
                              MEM_COMMIT, PAGE_READWRITE) != nullptr)
             {
-                g_demandCommitted += 0x1000;
+                g_demandCommitted.fetch_add(FallbackPageSize, std::memory_order_relaxed);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
@@ -446,12 +463,353 @@ namespace
         printf("Guest fault: %s at guest address 0x%08llX, which could not be "
                "committed (error %lu)\n",
             AccessKind(record->ExceptionInformation[0]),
-            (unsigned long long)offset, GetLastError());
+            (unsigned long long)offset, (unsigned long)GetLastError());
         printf("  %.1f MB had already been committed on demand.\n",
-            g_demandCommitted / 1048576.0);
+            g_demandCommitted.load(std::memory_order_relaxed) / 1048576.0);
         fflush(stdout);
         return EXCEPTION_CONTINUE_SEARCH;
     }
+#else // !_WIN32 (macOS / POSIX)
+    bool g_rawFaultsWanted = false;
+    uintptr_t g_executableHeaderAddr = 0;
+
+    enum class FaultDiagKind : uint8_t
+    {
+        FreedMemory  = 1,
+        StrayHeap    = 2,
+        DemandCommit = 3,
+    };
+
+    struct FaultDiagSlot
+    {
+        std::atomic<uint32_t> state{ 0 }; // 0 = empty, 1 = writing/draining, 2 = ready
+        FaultDiagKind kind = FaultDiagKind::FreedMemory;
+        bool running = false;
+        ULONG_PTR accessType = 0;
+        uint32_t address = 0;
+        int funcCount = 0;
+        uint32_t functions[10] = {};
+    };
+
+    constexpr size_t FaultDiagCapacity = 64;
+    FaultDiagSlot g_faultDiagSlots[FaultDiagCapacity];
+    std::atomic<uint32_t> g_pendingFaultDiags{ 0 };
+
+    void RecordFaultDiagnostic(FaultDiagKind kind, ULONG_PTR accessType, uint32_t address,
+                               bool running, const uint32_t* functions, int funcCount) noexcept
+    {
+        for (size_t i = 0; i < FaultDiagCapacity; ++i)
+        {
+            uint32_t expected = 0;
+            if (g_faultDiagSlots[i].state.compare_exchange_strong(
+                    expected, 1u, std::memory_order_acq_rel, std::memory_order_relaxed))
+            {
+                g_faultDiagSlots[i].kind       = kind;
+                g_faultDiagSlots[i].running    = running;
+                g_faultDiagSlots[i].accessType = accessType;
+                g_faultDiagSlots[i].address    = address;
+                const int clamped = (funcCount < 0) ? 0 : (funcCount > 10 ? 10 : funcCount);
+                g_faultDiagSlots[i].funcCount  = clamped;
+                for (int f = 0; f < clamped; ++f)
+                    g_faultDiagSlots[i].functions[f] = functions[f];
+                g_faultDiagSlots[i].state.store(2u, std::memory_order_release);
+                g_pendingFaultDiags.fetch_add(1u, std::memory_order_release);
+                return;
+            }
+        }
+    }
+
+    void AppendSigStr(char* buf, size_t cap, size_t& len, const char* s) noexcept
+    {
+        while (*s != '\0' && len + 1 < cap)
+            buf[len++] = *s++;
+    }
+
+    void AppendSigHex(char* buf, size_t cap, size_t& len, uint64_t val, int minDigits) noexcept
+    {
+        char tmp[16];
+        int n = 0;
+        do
+        {
+            const unsigned d = unsigned(val & 0xFu);
+            tmp[n++] = char(d < 10 ? ('0' + d) : ('a' + (d - 10)));
+            val >>= 4;
+        } while (val != 0 && n < 16);
+        while (n < minDigits && n < 16)
+            tmp[n++] = '0';
+        while (n > 0 && len + 1 < cap)
+            buf[len++] = tmp[--n];
+    }
+
+    void AppendSigDec(char* buf, size_t cap, size_t& len, uint64_t val) noexcept
+    {
+        char tmp[20];
+        int n = 0;
+        do
+        {
+            tmp[n++] = char('0' + (val % 10));
+            val /= 10;
+        } while (val != 0 && n < 20);
+        while (n > 0 && len + 1 < cap)
+            buf[len++] = tmp[--n];
+    }
+
+    void PosixFaultHandler(int sig, siginfo_t* info, void* uap)
+    {
+        auto* uc = static_cast<ucontext_t*>(uap);
+        const void* faultAddr = (info != nullptr) ? info->si_addr : nullptr;
+
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        bool isWrite = false;
+        ULONG_PTR accessType = 0;
+        if (uc != nullptr && uc->uc_mcontext != nullptr)
+        {
+#if defined(__aarch64__)
+            context.Rip = __darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+            context.Rsp = __darwin_arm_thread_state64_get_sp(uc->uc_mcontext->__ss);
+            context.Rbp = __darwin_arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+            context.Lr  = __darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
+            for (int i = 0; i < 29; i++)
+                context.X[i] = uc->uc_mcontext->__ss.__x[i];
+            context.X[29] = context.Rbp;
+            context.X[30] = context.Lr;
+            // Bit 6 (WnR) of ARM64 ESR_EL1 is 1 on a write fault, 0 on a read fault.
+            const uint64_t esr = uc->uc_mcontext->__es.__esr;
+            const uint32_t ec  = (esr >> 26) & 0x3Fu;
+            isWrite    = (esr & (1u << 6)) != 0;
+            accessType = (ec == 0x20 || ec == 0x21) ? 8 : (isWrite ? 1 : 0);
+#elif defined(__x86_64__)
+            context.Rip = uc->uc_mcontext->__ss.__rip;
+            context.Rsp = uc->uc_mcontext->__ss.__rsp;
+            context.Rbp = uc->uc_mcontext->__ss.__rbp;
+            const uint64_t err = uc->uc_mcontext->__es.__err;
+            isWrite    = (err & (1u << 1)) != 0;
+            accessType = (err & (1u << 4)) ? 8 : (isWrite ? 1 : 0);
+#endif
+        }
+
+        // A write to a page the renderer watches (write_watch.cpp): noted,
+        // the page made writable, and the write made again.
+        if ((sig == SIGBUS || sig == SIGSEGV) && isWrite && WriteWatch::HandleFault(faultAddr))
+            return;
+
+        if (g_rawFaultsWanted && (sig == SIGBUS || sig == SIGSEGV))
+        {
+            static std::atomic<int> raw{ 0 };
+            if (raw.fetch_add(1, std::memory_order_relaxed) < 400)
+            {
+                char buf[256];
+                size_t len = 0;
+                AppendSigStr(buf, sizeof(buf), len, "fault: sig ");
+                AppendSigDec(buf, sizeof(buf), len, uint64_t(unsigned(sig)));
+                AppendSigStr(buf, sizeof(buf), len, " kind ");
+                AppendSigDec(buf, sizeof(buf), len, uint64_t(accessType));
+                AppendSigStr(buf, sizeof(buf), len, " at 0x");
+                AppendSigHex(buf, sizeof(buf), len, context.Rip, 1);
+                AppendSigStr(buf, sizeof(buf), len, " (exe+");
+                AppendSigHex(buf, sizeof(buf), len, context.Rip - g_executableHeaderAddr, 1);
+                AppendSigStr(buf, sizeof(buf), len, ") address 0x");
+                AppendSigHex(buf, sizeof(buf), len, reinterpret_cast<uintptr_t>(faultAddr), 1);
+                AppendSigStr(buf, sizeof(buf), len, " thread ");
+                AppendSigDec(buf, sizeof(buf), len, uint64_t(GetCurrentThreadId()));
+                AppendSigStr(buf, sizeof(buf), len, "\n");
+                (void)::write(STDERR_FILENO, buf, len);
+            }
+        }
+
+        if (t_unwinding && sig != SIGTRAP)
+        {
+            signal(sig, SIG_DFL);
+            return;
+        }
+
+        if (sig == SIGTRAP)
+        {
+            if (Kernel::ReportWatchpoint(&context))
+                return;
+            signal(sig, SIG_DFL);
+            return;
+        }
+
+        if ((sig != SIGBUS && sig != SIGSEGV) || Guest::Base == nullptr)
+        {
+            static std::atomic<int> announced{ 0 };
+            if (announced.fetch_add(1) < 4)
+            {
+                printf("\n");
+                uint32_t functions[12] = {};
+                const int count = Sampler::WalkGuestStack(&context, functions, 12);
+                if (count > 0)
+                {
+                    printf("  guest call chain, innermost first:");
+                    for (int i = 0; i < count; i++)
+                        printf("%ssub_%08X", i == 0 ? " " : " <- ", functions[i]);
+                    printf("\n");
+                }
+                printf("Unhandled signal %d at %p\n", sig, reinterpret_cast<void*>(context.Rip));
+                fflush(stdout);
+            }
+            signal(sig, SIG_DFL);
+            return;
+        }
+
+        const auto faulting = static_cast<uint8_t*>(const_cast<void*>(faultAddr));
+
+        if (faulting < Guest::Base || faulting >= Guest::Base + Guest::TotalSize)
+        {
+            printf("\n");
+            {
+                uint32_t functions[12] = {};
+                const int count = Sampler::WalkGuestStack(&context, functions, 12);
+                if (count > 0)
+                {
+                    printf("\n  guest call chain, innermost first:");
+                    for (int i = 0; i < count; i++)
+                        printf("%ssub_%08X", i == 0 ? " " : " <- ", functions[i]);
+                    printf("\n");
+                }
+            }
+            printf("Host fault: %s at %p, outside the guest address space.\n"
+                   "  guest memory runs from %p to %p\n",
+                AccessKind(accessType), (void*)faulting,
+                (void*)Guest::Base, (void*)(Guest::Base + Guest::TotalSize));
+
+            Kernel::DumpRequested();
+
+            if (const PPCContext* guest = Kernel::CurrentContext())
+            {
+                printf("  guest registers r0 to r31, lr 0x%08X:", uint32_t(guest->lr));
+                for (int i = 0; i < 32; i++)
+                {
+                    if ((i % 8) == 0) printf("\n   r%-2d", i);
+                    printf(" %08X", Kernel::Register(*guest, i));
+                }
+                printf("\n");
+            }
+
+            const int64_t offset = int64_t(faulting - Guest::Base);
+            if (offset >= int64_t(Guest::TotalSize) &&
+                offset < int64_t(Guest::TotalSize) + 0x1000)
+            {
+                printf("  That is the very top of the address space, reached by an "
+                       "access that started just below 0xFFFFFFFF: a small\n"
+                       "  negative number used as a pointer, so something handed back\n"
+                       "  an error code where the caller expected an object.\n");
+            }
+
+            const int64_t tableStart = int64_t(Guest::FuncTableBase);
+            const int64_t implied =
+                int64_t(PPC_CODE_BASE) + ((offset - tableStart) / 2);
+            if (implied >= -0x1000 && implied < int64_t(PPC_CODE_BASE) + 0x1000000)
+            {
+                printf("  This is the function table being read for guest address "
+                       "0x%08X.\n", uint32_t(implied));
+                if (implied == 0)
+                {
+                    printf("  The guest called through a null function pointer: an "
+                           "object it\n  expected to be set up was not. The call "
+                           "chain above says which one.\n");
+                }
+                else
+                {
+                    printf("  No recompiled function stands behind that address.\n");
+                }
+            }
+            else if (reinterpret_cast<uintptr_t>(faulting) < 0x10000)
+            {
+                printf("  A near null address on an %s means an indirect call through\n",
+                    AccessKind(accessType));
+                printf("  an empty slot in the function table: the guest asked for a\n");
+                printf("  code address that has no recompiled function behind it.\n");
+            }
+            printf("  %.1f MB of guest memory had been committed on demand.\n",
+                g_demandCommitted.load(std::memory_order_relaxed) / 1048576.0);
+            Kernel::PrintHostStack(&context);
+            fflush(stdout);
+            signal(sig, SIG_DFL);
+            return;
+        }
+
+        const uint64_t offset = static_cast<uint64_t>(faulting - Guest::Base);
+        const uint64_t block = offset & ~(DemandCommitGranularity - 1);
+
+        if (Kernel::FreedMemoryTouched(uint32_t(offset)))
+        {
+            static std::atomic<int> announced{ 0 };
+            if (announced.fetch_add(1, std::memory_order_relaxed) < 12)
+            {
+                uint32_t functions[10] = {};
+                const int count = Sampler::WalkGuestStack(&context, functions, 10);
+                RecordFaultDiagnostic(FaultDiagKind::FreedMemory, accessType, uint32_t(offset), false, functions, count);
+            }
+            return;
+        }
+
+        auto RecordDemandCommitDiagnostics = [&](size_t newlyCommitted) noexcept {
+            if (newlyCommitted == 0)
+                return;
+
+            const uint32_t guest = uint32_t(offset);
+            const bool inHeap = (guest >= Guest::PhysicalHeapBase && guest < Guest::PhysicalHeapLimit) ||
+                                (guest >= Guest::VirtualHeapBase && guest < Guest::VirtualHeapLimit);
+            static std::atomic<int> strays{ 0 };
+            if (inHeap && strays.fetch_add(1, std::memory_order_relaxed) < 16)
+            {
+                uint32_t functions[10] = {};
+                const int count = Sampler::WalkGuestStack(&context, functions, 10);
+                RecordFaultDiagnostic(FaultDiagKind::StrayHeap, accessType, guest, false, functions, count);
+            }
+
+            static std::atomic<int> announced{ 0 };
+            const bool inImage = guest >= 0x82000000u && guest < uint32_t(Guest::FuncTableEnd);
+            const bool inHeaps = (guest >= 0x3F000000u && guest < 0x70000000u);
+            static std::atomic<int> runaway{ 0 };
+            const bool running = g_demandCommitted.load(std::memory_order_relaxed) > (256ull << 20) &&
+                                 runaway.fetch_add(1, std::memory_order_relaxed) < 12;
+            if ((!inImage && !inHeaps && announced.fetch_add(1, std::memory_order_relaxed) < 12) || running)
+            {
+                uint32_t functions[8] = {};
+                const int count = Sampler::WalkGuestStack(&context, functions, 8);
+                RecordFaultDiagnostic(FaultDiagKind::DemandCommit, accessType, guest, running, functions, count);
+            }
+        };
+
+        if (g_demandCommitted.load(std::memory_order_relaxed) < DemandCommitLimit ||
+            Platform::IsExternalAddressCommitted(Guest::Base + offset))
+        {
+            size_t newlyCommitted = 0;
+            if (Platform::CommitExternalRange(Guest::Base + block, DemandCommitGranularity,
+                                              PAGE_READWRITE, newlyCommitted))
+            {
+                RecordDemandCommitDiagnostics(newlyCommitted);
+                if (newlyCommitted > 0)
+                    g_demandCommitted.fetch_add(newlyCommitted, std::memory_order_relaxed);
+                return;
+            }
+
+            const uint64_t page = offset & ~(FallbackPageSize - 1);
+            if (Platform::CommitExternalRange(Guest::Base + page, FallbackPageSize,
+                                              PAGE_READWRITE, newlyCommitted))
+            {
+                RecordDemandCommitDiagnostics(newlyCommitted);
+                if (newlyCommitted > 0)
+                    g_demandCommitted.fetch_add(newlyCommitted, std::memory_order_relaxed);
+                return;
+            }
+        }
+
+        printf("\n");
+        printf("Guest fault: %s at guest address 0x%08llX, which could not be "
+               "committed (error %lu)\n",
+            AccessKind(accessType),
+            (unsigned long long)offset, (unsigned long)GetLastError());
+        printf("  %.1f MB had already been committed on demand.\n",
+            g_demandCommitted.load(std::memory_order_relaxed) / 1048576.0);
+        fflush(stdout);
+        signal(sig, SIG_DFL);
+    }
+#endif // _WIN32
 
     // The first pages are physical memory on this console, and the graphics
     // driver puts fences there: one of the first is written to physical
@@ -464,13 +822,13 @@ namespace
     bool Commit(uint64_t offset, uint64_t size, const char* what)
     {
         // Round out to page boundaries so adjacent commits cannot leave a hole.
-        const uint64_t begin = offset & ~uint64_t(0xFFF);
-        const uint64_t end = (offset + size + 0xFFF) & ~uint64_t(0xFFF);
+        const uint64_t begin = offset & ~(FallbackPageSize - 1);
+        const uint64_t end = (offset + size + FallbackPageSize - 1) & ~(FallbackPageSize - 1);
 
         if (VirtualAlloc(Guest::Base + begin, end - begin, MEM_COMMIT, PAGE_READWRITE) == nullptr)
         {
             fprintf(stderr, "  failed to commit %s at 0x%llX (%llu bytes): error %lu\n",
-                what, (unsigned long long)begin, (unsigned long long)(end - begin), GetLastError());
+                what, (unsigned long long)begin, (unsigned long long)(end - begin), (unsigned long)GetLastError());
             return false;
         }
         return true;
@@ -765,6 +1123,10 @@ bool Guest::Initialize(const char* xexPath)
     // section. The reservation is made as a placeholder, which can be split
     // and have views put into it without ever giving the address range back:
     // releasing and re-reserving was tried before and lost the range.
+    constexpr uint64_t WindowSize = 0x20000000;   // 512 MB of physical memory
+    constexpr uint64_t Windows[] = { 0xA0000000, 0xC0000000, 0xE0000000 };
+
+#ifdef _WIN32
     static const auto virtualAlloc2 = reinterpret_cast<PVOID (WINAPI*)(
         HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG)>(
         GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2"));
@@ -785,8 +1147,6 @@ bool Guest::Initialize(const char* xexPath)
     }
     Base = static_cast<uint8_t*>(g_reservation);
 
-    constexpr uint64_t WindowSize = 0x20000000;   // 512 MB of physical memory
-    constexpr uint64_t Windows[] = { 0xA0000000, 0xC0000000, 0xE0000000 };
     g_physicalSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
         PAGE_READWRITE | SEC_RESERVE, DWORD(WindowSize >> 32), DWORD(WindowSize), nullptr);
     if (g_physicalSection == nullptr)
@@ -828,6 +1188,51 @@ bool Guest::Initialize(const char* xexPath)
         fprintf(stderr, "  the reservation below the windows failed: error %lu\n", GetLastError());
         return false;
     }
+#else // !_WIN32 (macOS / POSIX)
+    const size_t pageSize = static_cast<size_t>(getpagesize());
+    const size_t reserveSize = TotalSize + pageSize + 0x20;
+    void* raw = mmap(nullptr, reserveSize, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (raw == MAP_FAILED)
+    {
+        fprintf(stderr, "  reservation failed: error %lu\n", (unsigned long)GetLastError());
+        return false;
+    }
+    g_reservation = raw;
+    g_reservationSize = reserveSize;
+    Base = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(raw) + 0x1F) & ~uintptr_t(0x1F));
+
+    char shmName[64] = {};
+    static std::atomic<uint32_t> shmCounter{ 0 };
+    snprintf(shmName, sizeof(shmName), "/cod3_phys_%d_%u", int(getpid()), shmCounter.fetch_add(1));
+    const int physFd = shm_open(shmName, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (physFd < 0)
+    {
+        fprintf(stderr, "  the physical memory section could not be made: error %lu\n",
+            (unsigned long)GetLastError());
+        return false;
+    }
+    shm_unlink(shmName);
+    if (ftruncate(physFd, static_cast<off_t>(WindowSize)) != 0)
+    {
+        fprintf(stderr, "  the physical memory section could not be sized: error %lu\n",
+            (unsigned long)GetLastError());
+        close(physFd);
+        return false;
+    }
+    for (uint64_t window : Windows)
+    {
+        if (mmap(Base + window, WindowSize, PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_FIXED, physFd, 0) == MAP_FAILED)
+        {
+            fprintf(stderr, "  the physical window at 0x%llX could not be mapped: error %lu\n",
+                (unsigned long long)window, (unsigned long)GetLastError());
+            close(physFd);
+            return false;
+        }
+    }
+    close(physFd);
+    Platform::RegisterExternalReservation(Base, TotalSize, Windows[0], TotalSize - Windows[0]);
+#endif // _WIN32
 
     // PPC_FUNC_PROLOGUE asserts this, and the vector loads assume it.
     if ((reinterpret_cast<uintptr_t>(Base) & 0x1F) != 0)
@@ -836,14 +1241,31 @@ bool Guest::Initialize(const char* xexPath)
         return false;
     }
 
+#ifdef _WIN32
     AddVectoredExceptionHandler(1, GuestFaultHandler);
     SetUnhandledExceptionFilter(LastChanceHandler);
+#else
+    {
+        const char* rawEnv = getenv("COD3_RAWFAULTS");
+        g_rawFaultsWanted = rawEnv != nullptr && rawEnv[0] != 0 && rawEnv[0] != '0';
+#ifdef __APPLE__
+        g_executableHeaderAddr = reinterpret_cast<uintptr_t>(_dyld_get_image_header(0));
+#endif
+    }
+    struct sigaction sa{};
+    sa.sa_sigaction = PosixFaultHandler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGTRAP, &sa, nullptr);
+#endif
     // An abort (a C++ exception nobody caught, a runtime check) says where
     // it was, which the fast fail that follows it does not.
     signal(SIGABRT, [](int) {
         CONTEXT context{};
         RtlCaptureContext(&context);
-        printf("\nabort() called on thread %lu\n", GetCurrentThreadId());
+        printf("\nabort() called on thread %lu\n", (unsigned long)GetCurrentThreadId());
         Kernel::PrintHostStack(&context);
         fflush(stdout);
     });
@@ -852,6 +1274,9 @@ bool Guest::Initialize(const char* xexPath)
     if (!Commit(PPC_IMAGE_BASE, PPC_IMAGE_SIZE, "image")) return false;
     if (!Commit(FuncTableBase, FuncTableSize, "function table")) return false;
     if (!Commit(StackBase - StackSize, StackSize, "stack")) return false;
+
+    if (xexPath == nullptr || xexPath[0] == '\0')
+        return true;
 
     // --- Load the executable ---------------------------------------------
     printf("\nLoading %s\n", xexPath);
@@ -984,18 +1409,89 @@ bool Guest::Initialize(const char* xexPath)
 // get to do this: every other thread would then fault on memory that is no
 // longer there, each fault reported as one that could not be committed, and the
 // message that actually mattered scrolls away. Report and stop instead.
+void Kernel::FlushFaultDiagnostics()
+{
+#ifndef _WIN32
+    if (g_pendingFaultDiags.load(std::memory_order_acquire) == 0)
+        return;
+
+    bool printedAny = false;
+    for (size_t i = 0; i < FaultDiagCapacity; ++i)
+    {
+        uint32_t expected = 2u;
+        if (!g_faultDiagSlots[i].state.compare_exchange_strong(
+                expected, 1u, std::memory_order_acq_rel, std::memory_order_relaxed))
+        {
+            continue;
+        }
+
+        const FaultDiagKind kind      = g_faultDiagSlots[i].kind;
+        const bool          running   = g_faultDiagSlots[i].running;
+        const ULONG_PTR     access    = g_faultDiagSlots[i].accessType;
+        const uint32_t      address   = g_faultDiagSlots[i].address;
+        const int           funcCount = g_faultDiagSlots[i].funcCount;
+        uint32_t            functions[10] = {};
+        for (int f = 0; f < funcCount && f < 10; ++f)
+            functions[f] = g_faultDiagSlots[i].functions[f];
+
+        g_faultDiagSlots[i].state.store(0u, std::memory_order_release);
+        g_pendingFaultDiags.fetch_sub(1u, std::memory_order_release);
+
+        if (kind == FaultDiagKind::FreedMemory)
+        {
+            Kernel::PrintFreedMemoryHistory(address);
+            printf("memory: freed memory %s at 0x%08X;", AccessKind(access), address);
+        }
+        else if (kind == FaultDiagKind::StrayHeap)
+        {
+            printf("memory: %s of heap memory never handed out, at 0x%08X;", AccessKind(access), address);
+        }
+        else
+        {
+            printf("commit: guest %s at 0x%08X, %s;",
+                AccessKind(access), address,
+                running ? "with hundreds of megabytes already committed on demand" : "outside every allocation");
+        }
+        if (funcCount > 0)
+        {
+            printf(" from");
+            for (int f = 0; f < funcCount; ++f)
+                printf(" sub_%08X", functions[f]);
+        }
+        printf("\n");
+        printedAny = true;
+    }
+    if (printedAny)
+        fflush(stdout);
+#endif
+}
+
 void Guest::Shutdown()
 {
+    Kernel::FlushFaultDiagnostics();
     if (g_reservation != nullptr)
     {
+#ifdef _WIN32
         for (uint64_t window : { 0xA0000000ull, 0xC0000000ull, 0xE0000000ull })
             UnmapViewOfFile(Base + window);
         VirtualFree(g_reservation, 0, MEM_RELEASE);
         g_reservation = nullptr;
         if (g_physicalSection != nullptr) CloseHandle(g_physicalSection);
         g_physicalSection = nullptr;
+#else
+        Platform::UnregisterExternalReservation(Base);
+        munmap(g_reservation, g_reservationSize);
+        g_reservation = nullptr;
+        g_reservationSize = 0;
+#endif
         Base = nullptr;
+        g_demandCommitted.store(0, std::memory_order_relaxed);
     }
+}
+
+uint64_t Guest::DemandCommitted()
+{
+    return g_demandCommitted.load(std::memory_order_acquire);
 }
 
 Kernel::Counters& Kernel::Stats()
@@ -1006,7 +1502,8 @@ Kernel::Counters& Kernel::Stats()
 
 void Kernel::Exit(int code)
 {
-    fprintf(stderr, "exit: code %d (0x%X) on thread %lu\n", code, unsigned(code), GetCurrentThreadId());
+    fprintf(stderr, "exit: code %d (0x%X) on thread %lu\n", code, unsigned(code), (unsigned long)GetCurrentThreadId());
+#ifdef _WIN32
     // GetConsoleProcessList reports how many processes share this console.
     // One means the console was created for us, so nothing else will be left
     // to read the output after the process ends.
@@ -1018,6 +1515,7 @@ void Kernel::Exit(int code)
         fflush(stdout);
         (void)getchar();
     }
+#endif
     Log::Finish();
     ExitProcess(static_cast<UINT>(code));
 }
@@ -1108,6 +1606,7 @@ void Kernel::StartKernelTrace()
 
 void Kernel::CountImportOn(const char* name, uint32_t subject)
 {
+    FlushFaultDiagnostics();
     if (g_kernelTraceLeft.load(std::memory_order_relaxed) > 0 &&
         strstr(name, "CriticalSection") == nullptr &&   // thousands a second, all alike
         !(subject == 0x100 && (name[2] == 'W' || name[2] == 'R')) &&   // the job lock, polled

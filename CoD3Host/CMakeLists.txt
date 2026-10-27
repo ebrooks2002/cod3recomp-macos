@@ -26,6 +26,7 @@ endif()
 add_executable(CoD3 WIN32
     "log.cpp"
     "main.cpp"
+    "selftest.cpp"
     "installer.cpp"
     "xdvdfs.cpp"
     "kernel.cpp"
@@ -35,7 +36,6 @@ add_executable(CoD3 WIN32
     "kernel_objects.cpp"
     "kernel_file.cpp"
     "kernel_xam.cpp"
-    "kernel_thread.cpp"
     "kernel_pcr.cpp"
     "kernel_apc.cpp"
     "kernel_video.cpp"
@@ -49,41 +49,43 @@ add_executable(CoD3 WIN32
     "native_crt.cpp"
     "probe.cpp"
     "timeline.cpp"
-    "render_d3d11.cpp"
     "render_state.cpp"
-    "render_commands.cpp"
-    "render_pipeline.cpp"
-    "render_shaders.cpp"
-    "render_resources.cpp"
-    "render_stats.cpp"
     "xenos_hlsl.cpp"
     "gpu.cpp"
-    "sampler.cpp"
-    "watchpoint.cpp"
     "scheduler.cpp"
-    "window.cpp"
-    "input.cpp"
     "settings.cpp"
-    "overlay.cpp"
     "../thirdparty/imgui/imgui.cpp"
     "../thirdparty/imgui/imgui_draw.cpp"
     "../thirdparty/imgui/imgui_tables.cpp"
     "../thirdparty/imgui/imgui_widgets.cpp"
-    "../thirdparty/imgui/backends/imgui_impl_dx11.cpp"
-    "../thirdparty/imgui/backends/imgui_impl_win32.cpp"
-    "audio_out.cpp"
-    "xma.cpp"
     "parallel.cpp"
     "title_fixes.cpp"
     "d3d_hooks.cpp"
     "native_state.cpp"
     "write_watch.cpp"
-    "watchdog.cpp"
-    "modules.cpp"
-    "coroutines.cpp")
+    "modules.cpp")
 
 if (WIN32)
-    target_sources(CoD3 PRIVATE "resources/CoD3.rc")
+    target_sources(CoD3 PRIVATE
+        "kernel_thread.cpp"
+        "render_d3d11.cpp"
+        "render_commands.cpp"
+        "render_pipeline.cpp"
+        "render_shaders.cpp"
+        "render_resources.cpp"
+        "render_stats.cpp"
+        "sampler.cpp"
+        "watchpoint.cpp"
+        "window.cpp"
+        "input.cpp"
+        "overlay.cpp"
+        "../thirdparty/imgui/backends/imgui_impl_dx11.cpp"
+        "../thirdparty/imgui/backends/imgui_impl_win32.cpp"
+        "audio_out.cpp"
+        "xma.cpp"
+        "watchdog.cpp"
+        "coroutines.cpp"
+        "resources/CoD3.rc")
 elseif (APPLE)
     target_sources(CoD3 PRIVATE "platform_macos.mm")
 endif()
@@ -95,15 +97,23 @@ set_target_properties(CoD3 PROPERTIES WIN32_EXECUTABLE OFF)
 target_link_libraries(CoD3 PRIVATE
     CoD3RecompLib   # the recompiled game code
     ${COD3_LEVEL_LIBRARIES}   # the levels' own code, one library each
-    XenonUtils      # XEX parsing, reused so the loader matches the recompiler
-    ole32           # IFileOpenDialog
-    winmm           # sound out
-    dbghelp         # the watchdog's stack walks
-    d3d11           # the host GPU
-    dxgi
-    d3dcompiler     # the menu's own shaders (Dear ImGui)
-    windowscodecs   # screenshots as PNG
-    shell32)
+    XenonUtils)     # XEX parsing, reused so the loader matches the recompiler
+
+if (WIN32)
+    target_link_libraries(CoD3 PRIVATE
+        ole32           # IFileOpenDialog
+        winmm           # sound out
+        dbghelp         # the watchdog's stack walks
+        d3d11           # the host GPU
+        dxgi
+        d3dcompiler     # the menu's own shaders (Dear ImGui)
+        windowscodecs   # screenshots as PNG
+        shell32)
+elseif (APPLE)
+    target_link_libraries(CoD3 PRIVATE
+        "-framework Foundation"
+        "-framework AppKit")
+endif()
 
 # Decompiled functions, from a CoD3Decomp checkout beside this repository (or
 # wherever COD3_DECOMP_DIR says): each takes the place of the recompiled
@@ -160,10 +170,15 @@ target_compile_options(CoD3 PRIVATE -Wno-unused-parameter)
 # Debug information for the host alone, so the watchdog can name the
 # functions on a stuck thread's stack. The recompiled library stays as it
 # is: its symbols would be gigabytes and say nothing a guest address does not.
-target_compile_options(CoD3 PRIVATE -g -gcodeview)
+if (WIN32)
+    target_compile_options(CoD3 PRIVATE -g -gcodeview)
 
-# The main thread runs guest code too, at whatever depth the title's own
-# calls reach; see ExCreateThread for why that wants a large host stack.
-target_link_options(CoD3 PRIVATE /STACK:16777216)
+    # The main thread runs guest code too, at whatever depth the title's own
+    # calls reach; see ExCreateThread for why that wants a large host stack.
+    target_link_options(CoD3 PRIVATE /STACK:16777216)
 
-target_link_options(CoD3 PRIVATE /DEBUG)
+    target_link_options(CoD3 PRIVATE /DEBUG)
+elseif (APPLE)
+    target_compile_options(CoD3 PRIVATE -g)
+    target_link_options(CoD3 PRIVATE -Wl,-stack_size,0x1000000)
+endif()

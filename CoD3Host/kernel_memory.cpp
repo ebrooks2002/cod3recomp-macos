@@ -37,7 +37,11 @@ namespace
     constexpr uint32_t X_STATUS_NO_MEMORY             = 0xC0000017;
     constexpr uint32_t X_STATUS_INVALID_PARAMETER     = 0xC000000D;
 
+#ifdef __APPLE__
+    constexpr uint32_t SmallPage = 16u << 10;
+#else
     constexpr uint32_t SmallPage = 4u << 10;
+#endif
     constexpr uint32_t LargePage = 64u << 10;
 
     uint32_t Align(uint32_t value, uint32_t to) { return (value + to - 1) & ~(to - 1); }
@@ -60,17 +64,71 @@ namespace
     // (fresh or out of a freed range) and each free, with the caller. When
     // the title reads memory it freed, the report says whose the memory was
     // and when it changed hands. The last few thousand only.
-    struct Event { uint32_t address, size, from; char kind; };
-    std::vector<Event>& History()
+    // Stored in a fixed-size versioned atomic ring buffer and paired with an
+    // atomic per-SmallPage freed bitmap so Kernel::FreedMemoryTouched is
+    // completely lock-free and async-signal-safe inside PosixFaultHandler.
+    struct HistorySlot
     {
-        static std::vector<Event> events;
-        return events;
-    }
+        std::atomic<uint64_t> seq{ 0 };   // odd = writing, idx*2 + 2 = published for idx
+        std::atomic<uint64_t> word0{ 0 }; // (uint64_t(address) << 32) | size
+        std::atomic<uint64_t> word1{ 0 }; // (uint64_t(from) << 32) | uint8_t(kind)
+    };
+    constexpr uint32_t HistoryCapacity = 16384; // power of 2
+    HistorySlot g_historyRing[HistoryCapacity];
+    uint64_t g_historyNextSlot = 0; // guarded by g_allocatorMutex
+    std::atomic<uint64_t> g_historyPublished{ 0 };
+
     void Note(char kind, uint32_t address, uint32_t size, uint32_t from)
     {
-        std::vector<Event>& events = History();
-        if (events.size() >= 16384) events.erase(events.begin(), events.begin() + 4096);
-        events.push_back({ address, size, from, kind });
+        const uint64_t idx = g_historyNextSlot++;
+        HistorySlot& slot = g_historyRing[idx & (HistoryCapacity - 1)];
+        slot.seq.store(idx * 2 + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        slot.word0.store((uint64_t(address) << 32) | uint64_t(size), std::memory_order_relaxed);
+        slot.word1.store((uint64_t(from) << 32) | uint64_t(uint8_t(kind)), std::memory_order_relaxed);
+        slot.seq.store(idx * 2 + 2, std::memory_order_release);
+        g_historyPublished.store(idx + 1, std::memory_order_release);
+    }
+
+    constexpr size_t TotalSmallPages = size_t(Guest::TotalSize / SmallPage);
+    constexpr size_t FreedBitmapWords = TotalSmallPages / 64;
+    std::atomic<uint64_t> g_freedPages[FreedBitmapWords];
+
+    void SetFreedPages(uint32_t address, uint32_t size, bool freed)
+    {
+        if (size == 0) return;
+        const uint64_t startByte = freed
+            ? ((uint64_t(address) + SmallPage - 1) & ~uint64_t(SmallPage - 1))
+            : (uint64_t(address) & ~uint64_t(SmallPage - 1));
+        const uint64_t endByte = freed
+            ? ((uint64_t(address) + size) & ~uint64_t(SmallPage - 1))
+            : ((uint64_t(address) + size + SmallPage - 1) & ~uint64_t(SmallPage - 1));
+        if (endByte <= startByte) return;
+
+        const size_t firstPage = size_t(startByte / SmallPage);
+        const size_t lastPage  = size_t(endByte / SmallPage);
+        for (size_t page = firstPage; page < lastPage && page < TotalSmallPages; ++page)
+        {
+            const uint64_t mask = 1ULL << (page & 63);
+            if (freed)
+                g_freedPages[page >> 6].fetch_or(mask, std::memory_order_release);
+            else
+                g_freedPages[page >> 6].fetch_and(~mask, std::memory_order_release);
+        }
+    }
+
+    bool IsFreedPage(uint32_t address)
+    {
+        const size_t page = size_t(address / SmallPage);
+        const uint64_t mask = 1ULL << (page & 63);
+        return (g_freedPages[page >> 6].load(std::memory_order_acquire) & mask) != 0;
+    }
+
+    void ClearFreedPage(uint32_t address)
+    {
+        const size_t page = size_t(address / SmallPage);
+        const uint64_t mask = 1ULL << (page & 63);
+        g_freedPages[page >> 6].fetch_and(~mask, std::memory_order_acq_rel);
     }
 
     uint32_t g_virtualNext = Guest::VirtualHeapBase;
@@ -117,6 +175,7 @@ namespace
         WriteWatch::Forget(address, size);
         DWORD was = 0;
         VirtualProtect(Guest::Ptr(address), size, PAGE_NOACCESS, &was);
+        SetFreedPages(address, size, true);
         std::map<uint32_t, uint32_t>& list = FreeList(physical);
         std::map<uint32_t, uint64_t>& times = FreedAt(physical);
         const uint64_t now = GetTickCount64();
@@ -158,6 +217,7 @@ namespace
             times[start + size] = freed;
         }
         Regions()[start] = { size, physical };
+        SetFreedPages(start, size, false);
         WriteWatch::Forget(start, size);
         DWORD was = 0;
         VirtualProtect(Guest::Ptr(start), size, PAGE_READWRITE, &was);
@@ -205,6 +265,7 @@ namespace
         {
             next = address + size;
             Regions()[address] = { size, physical };
+            SetFreedPages(address, size, false);
             Kernel::Stats().bytesAllocated.fetch_add(size, std::memory_order_relaxed);
             return address;
         }
@@ -228,7 +289,7 @@ namespace
     // Whether an address lies in a region handed out and not freed. The
     // pages of a freed region stay committed on the host, so this is what
     // tells a live region from a dead one.
-    bool InLiveRegion(uint32_t address)
+    [[maybe_unused]] bool InLiveRegion(uint32_t address)
     {
         auto it = Regions().upper_bound(address);
         if (it == Regions().begin()) return false;
@@ -306,6 +367,7 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory)
         // honour it and record the region.
         address = requested & ~(pageSize - 1);
         Regions()[address] = { size, false };
+        SetFreedPages(address, size, false);
     }
     else
     {
@@ -452,24 +514,44 @@ PPC_FUNC(__imp__MmFreePhysicalMemory)
     }
 }
 
+void Kernel::PrintFreedMemoryHistory(uint32_t address)
+{
+    static std::atomic<int> told{ 0 };
+    if (told.fetch_add(1, std::memory_order_relaxed) >= 4)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_allocatorMutex);
+    printf("memory: 0x%08X, what the regions holding it went through, oldest first:", address);
+    const uint64_t total = g_historyPublished.load(std::memory_order_acquire);
+    const uint64_t start = total > HistoryCapacity ? total - HistoryCapacity : 0;
+    for (uint64_t i = start; i < total; ++i)
+    {
+        const HistorySlot& slot = g_historyRing[i & (HistoryCapacity - 1)];
+        const uint64_t expectedSeq = i * 2 + 2;
+        const uint64_t s1 = slot.seq.load(std::memory_order_acquire);
+        if (s1 != expectedSeq) continue;
+        const uint64_t w0 = slot.word0.load(std::memory_order_relaxed);
+        const uint64_t w1 = slot.word1.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const uint64_t s2 = slot.seq.load(std::memory_order_relaxed);
+        if (s1 != s2) continue;
+
+        const uint32_t evAddress = uint32_t(w0 >> 32);
+        const uint32_t evSize    = uint32_t(w0);
+        const uint32_t evFrom    = uint32_t(w1 >> 32);
+        const char     evKind    = char(uint8_t(w1));
+        if (address >= evAddress && address - evAddress < evSize)
+            printf(" %s 0x%08X+%uK by %08X;", evKind == 'f' ? "freed" : evKind == 'r' ? "given again" : "given",
+                evAddress, evSize >> 10, evFrom);
+    }
+    printf("\n");
+}
+
 bool Kernel::FreedMemoryTouched(uint32_t address)
 {
-    std::lock_guard<std::mutex> lock(g_allocatorMutex);
     const bool inHeap = (address >= Guest::PhysicalHeapBase && address < Guest::PhysicalHeapLimit) ||
                         (address >= Guest::VirtualHeapBase && address < Guest::VirtualHeapLimit);
-    if (!inHeap || InLiveRegion(address)) return false;
-    // The first few: whose the memory was, from the history.
-    static int told = 0;
-    if (told < 4)
-    {
-        told++;
-        printf("memory: 0x%08X, what the regions holding it went through, oldest first:", address);
-        for (const Event& event : History())
-            if (address >= event.address && address - event.address < event.size)
-                printf(" %s 0x%08X+%uK by %08X;", event.kind == 'f' ? "freed" : event.kind == 'r' ? "given again" : "given",
-                    event.address, event.size >> 10, event.from);
-        printf("\n");
-    }
+    if (!inHeap || !IsFreedPage(address)) return false;
     // Let the access through, at the page: the run goes on, as it did when
     // freed memory kept its contents. A page that was never committed has
     // no protection to change, and saying it had been let through then sent
@@ -478,7 +560,16 @@ bool Kernel::FreedMemoryTouched(uint32_t address)
     // page is left to the demand commit, which hands it out as zeros, as
     // the console hands out a fresh page.
     DWORD was = 0;
-    return VirtualProtect(Guest::Ptr(address & ~0xFFFu), 0x1000, PAGE_READWRITE, &was) != FALSE;
+    if (VirtualProtect(Guest::Ptr(address & ~(SmallPage - 1)), SmallPage, PAGE_READWRITE, &was) == FALSE)
+    {
+        ClearFreedPage(address);
+        return false;
+    }
+    ClearFreedPage(address);
+#ifdef _WIN32
+    PrintFreedMemoryHistory(address);
+#endif
+    return true;
 }
 
 void Kernel::ReportHeaps()

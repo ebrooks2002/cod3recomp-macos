@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include "scheduler.h"
 #include "sampler.h"
+#include "selftest.h"
 #include "window.h"
 #include "xdvdfs.h"
 
@@ -50,6 +51,7 @@ namespace
         printf("  --extract-one <iso> <path in iso> <output file>\n");
         printf("                    pull a single file out of a disc image\n");
         printf("  --install-only    run setup but do not start the game\n");
+        printf("  --self-test=<s >  run host verification suite (e.g. vm)\n");
         printf("  --help            this text\n");
         printf("\n");
     }
@@ -186,6 +188,14 @@ int Run(int argc, char** argv)
         {
             Usage();
             return 0;
+        }
+        if (option.rfind("--self-test=", 0) == 0)
+        {
+            return SelfTest::Run(option.substr(12));
+        }
+        if (option == "--self-test" && hasValue)
+        {
+            return SelfTest::Run(argv[++i]);
         }
         if (option == "--install-only")
         {
