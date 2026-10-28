@@ -14,8 +14,10 @@
 #include <sys/stat.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 
 namespace
@@ -246,16 +248,69 @@ namespace
         return pageSize;
     }
 
+    constexpr uintptr_t BorrowedThreadHandleTag = 0x4000000000000000ULL;
+    constexpr uintptr_t OwnedThreadHandleTag    = 0x2000000000000000ULL;
+    constexpr uintptr_t SnapshotHandleTag       = 0x1000000000000000ULL;
+    constexpr uintptr_t SpecialHandleMask       = BorrowedThreadHandleTag | OwnedThreadHandleTag | SnapshotHandleTag;
+
+    struct ToolhelpThreadSnapshot
+    {
+        std::vector<DWORD> threadIds;
+        size_t index = 0;
+    };
+
     int HandleToFd(HANDLE h)
     {
         if (h == nullptr || h == INVALID_HANDLE_VALUE) return -1;
-        return static_cast<int>(reinterpret_cast<intptr_t>(h) - 1);
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(h);
+        if ((raw & SpecialHandleMask) != 0 || raw == 0 || raw > 0x100000u)
+            return -1;
+        return static_cast<int>(raw - 1);
     }
 
     HANDLE FdToHandle(int fd)
     {
         if (fd < 0) return INVALID_HANDLE_VALUE;
-        return reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd) + 1);
+        return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(fd + 1));
+    }
+
+    HANDLE BorrowedThreadToHandle(mach_port_t port)
+    {
+        if (port == MACH_PORT_NULL) return nullptr;
+        return reinterpret_cast<HANDLE>(BorrowedThreadHandleTag | static_cast<uintptr_t>(port));
+    }
+
+    HANDLE OwnedThreadToHandle(mach_port_t port)
+    {
+        if (port == MACH_PORT_NULL) return nullptr;
+        return reinterpret_cast<HANDLE>(OwnedThreadHandleTag | static_cast<uintptr_t>(port));
+    }
+
+    mach_port_t HandleToMachPort(HANDLE h)
+    {
+        if (h == nullptr || h == INVALID_HANDLE_VALUE) return MACH_PORT_NULL;
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(h);
+        if ((raw & (BorrowedThreadHandleTag | OwnedThreadHandleTag)) == 0)
+            return MACH_PORT_NULL;
+        return static_cast<mach_port_t>(raw & ~SpecialHandleMask);
+    }
+
+    DWORD MachPortToOsId(mach_port_t port)
+    {
+        if (port == MACH_PORT_NULL) return 0;
+        if (pthread_t pt = pthread_from_mach_thread_np(port))
+        {
+            const DWORD id = GetThreadId(pt);
+            if (id != 0) return id;
+        }
+        thread_identifier_info_data_t idInfo{};
+        mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
+        if (thread_info(port, THREAD_IDENTIFIER_INFO,
+                        reinterpret_cast<thread_info_t>(&idInfo), &count) == KERN_SUCCESS)
+        {
+            return static_cast<DWORD>(idInfo.thread_id);
+        }
+        return static_cast<DWORD>(port);
     }
 }
 
@@ -646,6 +701,28 @@ HANDLE CreateFileW(const wchar_t* lpFileName, DWORD dwDesiredAccess, DWORD dwSha
 
 BOOL CloseHandle(HANDLE hObject)
 {
+    if (hObject == nullptr || hObject == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(hObject);
+    if ((raw & BorrowedThreadHandleTag) != 0)
+        return TRUE;
+
+    if ((raw & OwnedThreadHandleTag) != 0)
+    {
+        const mach_port_t port = static_cast<mach_port_t>(raw & ~SpecialHandleMask);
+        if (port != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), port);
+        return TRUE;
+    }
+
+    if ((raw & SnapshotHandleTag) != 0)
+    {
+        auto* snap = reinterpret_cast<ToolhelpThreadSnapshot*>(raw & ~SpecialHandleMask);
+        delete snap;
+        return TRUE;
+    }
+
     const int fd = HandleToFd(hObject);
     if (fd < 0) return FALSE;
     return close(fd) == 0 ? TRUE : FALSE;
@@ -737,6 +814,363 @@ BOOL DeleteFileA(LPCSTR lpFileName)
 {
     if (!lpFileName) return FALSE;
     return unlink(lpFileName) == 0 ? TRUE : FALSE;
+}
+
+// --- Thread & Toolhelp Helpers ----------------------------------------------
+
+namespace
+{
+    struct PthreadStartInfo
+    {
+        LPTHREAD_START_ROUTINE startAddress = nullptr;
+        LPVOID parameter = nullptr;
+        bool createSuspended = false;
+        std::mutex mutex;
+        std::condition_variable cv;
+        mach_port_t machPort = MACH_PORT_NULL;
+        DWORD osId = 0;
+        bool childReady = false;
+        std::atomic<bool> parentDone{ false };
+    };
+
+    void* PthreadTrampoline(void* arg)
+    {
+        auto* holder = static_cast<std::shared_ptr<PthreadStartInfo>*>(arg);
+        std::shared_ptr<PthreadStartInfo> info = std::move(*holder);
+        delete holder;
+
+        const mach_port_t selfPort = pthread_mach_thread_np(pthread_self());
+        const DWORD osId = GetCurrentThreadId();
+        const bool createSuspended = info->createSuspended;
+        const LPTHREAD_START_ROUTINE startAddress = info->startAddress;
+        LPVOID const parameter = info->parameter;
+
+        {
+            std::lock_guard<std::mutex> lock(info->mutex);
+            info->machPort = selfPort;
+            info->osId = osId;
+            info->childReady = true;
+            info->cv.notify_one();
+        }
+
+        if (createSuspended)
+        {
+            while (!info->parentDone.load(std::memory_order_acquire))
+            {
+#if defined(__aarch64__)
+                __builtin_arm_yield();
+#else
+                sched_yield();
+#endif
+            }
+        }
+
+        info.reset();
+        const DWORD exitCode = startAddress ? startAddress(parameter) : 0;
+        return reinterpret_cast<void*>(static_cast<uintptr_t>(exitCode));
+    }
+}
+
+HANDLE GetCurrentThread()
+{
+    return BorrowedThreadToHandle(pthread_mach_thread_np(pthread_self()));
+}
+
+BOOL DuplicateHandle(HANDLE, HANDLE hSourceHandle, HANDLE, HANDLE* lpTargetHandle,
+                     DWORD, BOOL, DWORD)
+{
+    if (!lpTargetHandle) return FALSE;
+    const mach_port_t port = HandleToMachPort(hSourceHandle);
+    if (port == MACH_PORT_NULL)
+    {
+        *lpTargetHandle = nullptr;
+        return FALSE;
+    }
+    *lpTargetHandle = BorrowedThreadToHandle(port);
+    return TRUE;
+}
+
+HANDLE CreateThread(void*, size_t dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress,
+                    LPVOID lpParameter, DWORD dwCreationFlags, DWORD* lpThreadId)
+{
+    if (!lpStartAddress) return nullptr;
+
+    auto info = std::make_shared<PthreadStartInfo>();
+    info->startAddress = lpStartAddress;
+    info->parameter = lpParameter;
+    info->createSuspended = (dwCreationFlags & CREATE_SUSPENDED) != 0;
+
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0)
+        return nullptr;
+
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    constexpr size_t MinHostStackSize = 8u << 20; // 8 MB minimum host stack
+    const size_t pageSize = HostPageSize();
+    size_t stackSize = dwStackSize > MinHostStackSize ? dwStackSize : MinHostStackSize;
+    stackSize = (stackSize + pageSize - 1) & ~(pageSize - 1);
+    pthread_attr_setstacksize(&attr, stackSize);
+
+    auto* holder = new std::shared_ptr<PthreadStartInfo>(info);
+    pthread_t pt{};
+    const int rc = pthread_create(&pt, &attr, PthreadTrampoline, holder);
+    pthread_attr_destroy(&attr);
+    if (rc != 0)
+    {
+        delete holder;
+        return nullptr;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(info->mutex);
+        info->cv.wait(lock, [&] { return info->childReady; });
+    }
+
+    if (info->createSuspended)
+    {
+        thread_suspend(info->machPort);
+        info->parentDone.store(true, std::memory_order_release);
+    }
+
+    if (lpThreadId)
+        *lpThreadId = info->osId;
+
+    return BorrowedThreadToHandle(info->machPort);
+}
+
+DWORD SuspendThread(HANDLE hThread)
+{
+    const mach_port_t port = HandleToMachPort(hThread);
+    if (port == MACH_PORT_NULL)
+        return DWORD(-1);
+
+    DWORD prevCount = 0;
+    thread_basic_info_data_t basicInfo{};
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO,
+                    reinterpret_cast<thread_info_t>(&basicInfo), &count) == KERN_SUCCESS)
+    {
+        prevCount = basicInfo.suspend_count > 0 ? static_cast<DWORD>(basicInfo.suspend_count) : 0;
+    }
+
+    if (thread_suspend(port) != KERN_SUCCESS)
+        return DWORD(-1);
+
+    return prevCount;
+}
+
+DWORD ResumeThread(HANDLE hThread)
+{
+    const mach_port_t port = HandleToMachPort(hThread);
+    if (port == MACH_PORT_NULL)
+        return DWORD(-1);
+
+    const kern_return_t kr = thread_resume(port);
+    if (kr == KERN_SUCCESS)
+        return 1;
+    if (kr == KERN_FAILURE)
+        return 0;
+    return DWORD(-1);
+}
+
+BOOL SetThreadPriority(HANDLE hThread, int nPriority)
+{
+    const mach_port_t port = HandleToMachPort(hThread);
+    if (port == MACH_PORT_NULL)
+        return FALSE;
+
+    thread_precedence_policy_data_t policy{};
+    if (nPriority > 0)      policy.importance = 4;
+    else if (nPriority < 0) policy.importance = -4;
+    else                    policy.importance = 0;
+
+    thread_policy_set(port, THREAD_PRECEDENCE_POLICY,
+                      reinterpret_cast<thread_policy_t>(&policy),
+                      THREAD_PRECEDENCE_POLICY_COUNT);
+    return TRUE;
+}
+
+HANDLE OpenThread(DWORD, BOOL, DWORD dwThreadId)
+{
+    if (dwThreadId == 0) return nullptr;
+
+    thread_act_array_t threadList = nullptr;
+    mach_msg_type_number_t threadCount = 0;
+    if (task_threads(mach_task_self(), &threadList, &threadCount) != KERN_SUCCESS)
+        return nullptr;
+
+    mach_port_t foundPort = MACH_PORT_NULL;
+    for (mach_msg_type_number_t i = 0; i < threadCount; ++i)
+    {
+        const mach_port_t port = threadList[i];
+        if (foundPort == MACH_PORT_NULL && MachPortToOsId(port) == dwThreadId)
+        {
+            foundPort = port;
+        }
+        else
+        {
+            mach_port_deallocate(mach_task_self(), port);
+        }
+    }
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threadList),
+                  threadCount * sizeof(thread_act_t));
+
+    return OwnedThreadToHandle(foundPort);
+}
+
+BOOL GetThreadContext(HANDLE hThread, CONTEXT* lpContext)
+{
+    if (!lpContext) return FALSE;
+    const mach_port_t port = HandleToMachPort(hThread);
+    if (port == MACH_PORT_NULL) return FALSE;
+
+#if defined(__aarch64__)
+    if (lpContext->ContextFlags == 0 || (lpContext->ContextFlags & CONTEXT_FULL) != 0)
+    {
+        arm_thread_state64_t state{};
+        mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(port, ARM_THREAD_STATE64,
+                             reinterpret_cast<thread_state_t>(&state), &count) != KERN_SUCCESS)
+        {
+            return FALSE;
+        }
+        for (int i = 0; i < 29; ++i)
+            lpContext->X[i] = state.__x[i];
+        lpContext->Rbp = arm_thread_state64_get_fp(state);
+        lpContext->Lr  = arm_thread_state64_get_lr(state);
+        lpContext->Rsp = arm_thread_state64_get_sp(state);
+        lpContext->Rip = arm_thread_state64_get_pc(state);
+    }
+
+    if (lpContext->ContextFlags & CONTEXT_DEBUG_REGISTERS)
+    {
+        arm_debug_state64_t dbg{};
+        mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+        if (thread_get_state(port, ARM_DEBUG_STATE64,
+                             reinterpret_cast<thread_state_t>(&dbg), &count) == KERN_SUCCESS)
+        {
+            lpContext->Dr0 = dbg.__wvr[0];
+            lpContext->Dr7 = dbg.__wcr[0];
+        }
+    }
+    return TRUE;
+#else
+    return FALSE;
+#endif
+}
+
+BOOL SetThreadContext(HANDLE hThread, const CONTEXT* lpContext)
+{
+    if (!lpContext) return FALSE;
+    const mach_port_t port = HandleToMachPort(hThread);
+    if (port == MACH_PORT_NULL) return FALSE;
+
+#if defined(__aarch64__)
+    if (lpContext->ContextFlags & CONTEXT_DEBUG_REGISTERS)
+    {
+        arm_debug_state64_t dbg{};
+        mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+        thread_get_state(port, ARM_DEBUG_STATE64,
+                         reinterpret_cast<thread_state_t>(&dbg), &count);
+        dbg.__wvr[0] = lpContext->Dr0;
+        if (lpContext->Dr7 != 0)
+            dbg.__wcr[0] = (1u << 0) | (2u << 1) | (2u << 3) | (0xFu << 5);
+        else
+            dbg.__wcr[0] = 0;
+        return thread_set_state(port, ARM_DEBUG_STATE64,
+                                reinterpret_cast<thread_state_t>(&dbg),
+                                ARM_DEBUG_STATE64_COUNT) == KERN_SUCCESS ? TRUE : FALSE;
+    }
+    return TRUE;
+#else
+    return FALSE;
+#endif
+}
+
+BOOL GetThreadTimes(HANDLE hThread, FILETIME* lpCreationTime, FILETIME* lpExitTime,
+                    FILETIME* lpKernelTime, FILETIME* lpUserTime)
+{
+    const mach_port_t port = HandleToMachPort(hThread);
+    if (port == MACH_PORT_NULL) return FALSE;
+
+    thread_basic_info_data_t basicInfo{};
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO,
+                    reinterpret_cast<thread_info_t>(&basicInfo), &count) != KERN_SUCCESS)
+    {
+        return FALSE;
+    }
+
+    auto toFileTime = [](const time_value_t& tv, FILETIME* out) {
+        if (!out) return;
+        const uint64_t ticks = static_cast<uint64_t>(tv.seconds) * 10000000ULL +
+                               static_cast<uint64_t>(tv.microseconds) * 10ULL;
+        out->dwLowDateTime  = static_cast<DWORD>(ticks & 0xFFFFFFFFULL);
+        out->dwHighDateTime = static_cast<DWORD>(ticks >> 32);
+    };
+
+    if (lpCreationTime) { lpCreationTime->dwLowDateTime = 0; lpCreationTime->dwHighDateTime = 0; }
+    if (lpExitTime)     { lpExitTime->dwLowDateTime = 0;     lpExitTime->dwHighDateTime = 0; }
+    toFileTime(basicInfo.system_time, lpKernelTime);
+    toFileTime(basicInfo.user_time, lpUserTime);
+    return TRUE;
+}
+
+HANDLE CreateToolhelp32Snapshot(DWORD dwFlags, DWORD)
+{
+    if ((dwFlags & TH32CS_SNAPTHREAD) == 0)
+        return INVALID_HANDLE_VALUE;
+
+    thread_act_array_t threadList = nullptr;
+    mach_msg_type_number_t threadCount = 0;
+    if (task_threads(mach_task_self(), &threadList, &threadCount) != KERN_SUCCESS)
+        return INVALID_HANDLE_VALUE;
+
+    auto* snap = new ToolhelpThreadSnapshot();
+    snap->threadIds.reserve(threadCount);
+    for (mach_msg_type_number_t i = 0; i < threadCount; ++i)
+    {
+        const DWORD osId = MachPortToOsId(threadList[i]);
+        if (osId != 0)
+            snap->threadIds.push_back(osId);
+        mach_port_deallocate(mach_task_self(), threadList[i]);
+    }
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threadList),
+                  threadCount * sizeof(thread_act_t));
+
+    return reinterpret_cast<HANDLE>(SnapshotHandleTag | reinterpret_cast<uintptr_t>(snap));
+}
+
+BOOL Thread32First(HANDLE hSnapshot, THREADENTRY32* lpte)
+{
+    if (!lpte || hSnapshot == nullptr || hSnapshot == INVALID_HANDLE_VALUE)
+        return FALSE;
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(hSnapshot);
+    if ((raw & SnapshotHandleTag) == 0)
+        return FALSE;
+    auto* snap = reinterpret_cast<ToolhelpThreadSnapshot*>(raw & ~SpecialHandleMask);
+    snap->index = 0;
+    if (snap->threadIds.empty())
+        return FALSE;
+    lpte->th32ThreadID = snap->threadIds[snap->index++];
+    lpte->th32OwnerProcessID = GetCurrentProcessId();
+    return TRUE;
+}
+
+BOOL Thread32Next(HANDLE hSnapshot, THREADENTRY32* lpte)
+{
+    if (!lpte || hSnapshot == nullptr || hSnapshot == INVALID_HANDLE_VALUE)
+        return FALSE;
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(hSnapshot);
+    if ((raw & SnapshotHandleTag) == 0)
+        return FALSE;
+    auto* snap = reinterpret_cast<ToolhelpThreadSnapshot*>(raw & ~SpecialHandleMask);
+    if (snap->index >= snap->threadIds.size())
+        return FALSE;
+    lpte->th32ThreadID = snap->threadIds[snap->index++];
+    lpte->th32OwnerProcessID = GetCurrentProcessId();
+    return TRUE;
 }
 
 // --- Display & Keyboard Helpers ---------------------------------------------
@@ -1077,16 +1511,30 @@ namespace Platform
             return false;
         return IsExternalPageCommitted(extBase, addr);
     }
+
+    bool SafeReadMemory(const void* src, void* dst, size_t size) noexcept
+    {
+        if (!src || !dst || size == 0)
+            return false;
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(src);
+        if (addr < 0x10000u)
+            return false;
+        mach_vm_size_t outSize = 0;
+        const kern_return_t kr = mach_vm_read_overwrite(
+            mach_task_self(),
+            static_cast<mach_vm_address_t>(addr),
+            static_cast<mach_vm_size_t>(size),
+            reinterpret_cast<mach_vm_address_t>(dst),
+            &outSize);
+        return kr == KERN_SUCCESS && outSize == size;
+    }
 }
 
 // ============================================================================
-// Weak fallback stubs for Component 4–7 subsystems until their translation
-// units are enabled on macOS. Strong definitions in Component 4–7 automatically
+// Weak fallback stubs for Component 5–7 subsystems until their translation
+// units are enabled on macOS. Strong definitions in Component 5–7 automatically
 // override these weak symbols at link time.
 // ============================================================================
-#include "kernel.h"
-#include "coroutines.h"
-#include "sampler.h"
 #include "window.h"
 #include "input.h"
 #include "overlay.h"
@@ -1097,55 +1545,6 @@ namespace Platform
 #include "render_shaders.h"
 
 #define COD3_WEAK __attribute__((weak))
-
-COD3_WEAK PPC_FUNC(__imp__ExCreateThread)            { ctx.r3.u32 = 0; }
-COD3_WEAK PPC_FUNC(__imp__KeResumeThread)            { ctx.r3.u32 = 0; }
-COD3_WEAK PPC_FUNC(__imp__NtResumeThread)            { ctx.r3.u32 = 0; }
-COD3_WEAK PPC_FUNC(__imp__NtSuspendThread)           { ctx.r3.u32 = 0; }
-COD3_WEAK PPC_FUNC(__imp__ExTerminateThread)         { ctx.r3.u32 = 0; }
-COD3_WEAK PPC_FUNC(__imp__KeSetAffinityThread)       { ctx.r3.u32 = 1; }
-COD3_WEAK PPC_FUNC(__imp__KeSetBasePriorityThread)   { ctx.r3.u32 = 0; }
-
-namespace Guest
-{
-    COD3_WEAK uint32_t AllocateStack(uint32_t) { return StackBase; }
-}
-
-namespace Kernel
-{
-    COD3_WEAK void RegisterEntryThread() {}
-    COD3_WEAK uint32_t ThreadObjectFor(uint32_t) { return 0; }
-    COD3_WEAK std::string DescribeThreadHandle(uint32_t) { return {}; }
-    COD3_WEAK void ProfileHostThread(uint32_t, const char*, const char*) {}
-    COD3_WEAK void StartWatchdog() {}
-    COD3_WEAK void PrintHostStack(void*) {}
-    COD3_WEAK void WatchWrite(uint32_t, bool) {}
-    COD3_WEAK void ArmWatchpoints() {}
-    COD3_WEAK bool ReportWatchpoint(void*) { return false; }
-}
-
-namespace Coroutines
-{
-    COD3_WEAK void Begin(PPCContext& ctx, uint8_t* base, uint32_t, PPCFunc* entry) { if (entry) entry(ctx, base); }
-    COD3_WEAK void Resume(PPCContext&, uint8_t*, uint32_t) {}
-    COD3_WEAK bool YieldIfCoroutine(jmp_buf&, int) { return false; }
-    COD3_WEAK bool Finished(uint32_t) { return true; }
-    COD3_WEAK void Destroy(uint32_t) {}
-    COD3_WEAK bool Inside() { return false; }
-    COD3_WEAK void NewGeneration() {}
-}
-
-namespace Sampler
-{
-    COD3_WEAK uint32_t FunctionAt(unsigned long long) { return 0; }
-    COD3_WEAK int WalkGuestStack(void*, uint32_t*, int) { return 0; }
-    COD3_WEAK int FunctionsOnStack(uint32_t*, int) { return 0; }
-    COD3_WEAK void SampleNow() {}
-    COD3_WEAK bool ThreadTimesWanted() { return false; }
-    COD3_WEAK void ReportThreadTimes(const std::vector<std::pair<uint32_t, const char*>>&) {}
-    COD3_WEAK void Start(int) {}
-    COD3_WEAK void Stop() {}
-}
 
 namespace Window
 {

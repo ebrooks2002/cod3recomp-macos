@@ -354,10 +354,41 @@ struct CONTEXT
     uint64_t Rbp;   // FP (x29) on ARM64 / RBP on x86_64
     uint64_t Lr;    // LR (x30) on ARM64
     uint64_t X[31];
+    uint64_t Dr0;   // Hardware watchpoint address (ARM64 DBGWVR0_EL1 / x86 DR0)
+    uint64_t Dr7;   // Hardware watchpoint control (x86 DR7 style encoding)
 };
 
 inline constexpr DWORD CONTEXT_FULL            = 0x00100007u;
 inline constexpr DWORD CONTEXT_DEBUG_REGISTERS = 0x00100010u;
+
+using LPTHREAD_START_ROUTINE = DWORD (WINAPI *)(void*);
+
+inline constexpr DWORD CREATE_SUSPENDED                  = 0x00000004u;
+inline constexpr DWORD STACK_SIZE_PARAM_IS_A_RESERVATION = 0x00010000u;
+
+inline constexpr int THREAD_PRIORITY_BELOW_NORMAL = -1;
+inline constexpr int THREAD_PRIORITY_NORMAL       = 0;
+inline constexpr int THREAD_PRIORITY_ABOVE_NORMAL = 1;
+
+inline constexpr DWORD THREAD_SUSPEND_RESUME            = 0x0002u;
+inline constexpr DWORD THREAD_GET_CONTEXT               = 0x0008u;
+inline constexpr DWORD THREAD_SET_CONTEXT               = 0x0010u;
+inline constexpr DWORD THREAD_QUERY_INFORMATION         = 0x0040u;
+inline constexpr DWORD THREAD_QUERY_LIMITED_INFORMATION = 0x0800u;
+inline constexpr DWORD THREAD_ALL_ACCESS                = 0x1FFFFFu;
+
+inline constexpr DWORD TH32CS_SNAPTHREAD = 0x00000004u;
+
+struct THREADENTRY32
+{
+    DWORD dwSize;
+    DWORD cntUsage;
+    DWORD th32ThreadID;
+    DWORD th32OwnerProcessID;
+    LONG  tpBasePri;
+    LONG  tpDeltaPri;
+    DWORD dwFlags;
+};
 
 // --- Thread & process helpers -----------------------------------------------
 
@@ -435,20 +466,27 @@ inline uint64_t __rdtsc()
     _exit(static_cast<int>(exitCode));
 }
 
+[[noreturn]] inline void ExitThread(DWORD dwExitCode)
+{
+    pthread_exit(reinterpret_cast<void*>(static_cast<uintptr_t>(dwExitCode)));
+}
+
 inline void RtlCaptureContext(CONTEXT* ctx)
 {
     if (!ctx) return;
     memset(ctx, 0, sizeof(*ctx));
+    ctx->ContextFlags = CONTEXT_FULL;
 #if defined(__aarch64__) || defined(_M_ARM64)
-    uint64_t fp = 0, lr = 0, sp = 0;
+    uint64_t pc = 0, fp = 0, sp = 0;
     asm volatile(
-        "mov %0, x29\n"
-        "mov %1, x30\n"
+        "adr %0, .\n"
+        "mov %1, x29\n"
         "mov %2, sp\n"
-        : "=r"(fp), "=r"(lr), "=r"(sp));
+        : "=r"(pc), "=r"(fp), "=r"(sp));
+    const uint64_t lr = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+    ctx->Rip = pc;
     ctx->Rbp = fp;
     ctx->Lr  = lr;
-    ctx->Rip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
     ctx->Rsp = sp;
     ctx->X[29] = fp;
     ctx->X[30] = lr;
@@ -751,6 +789,27 @@ UINT  MapVirtualKeyW(UINT uCode, UINT uMapType);
 int   GetKeyNameTextW(LONG lParam, LPWSTR lpString, int cchSize);
 DWORD GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename, DWORD nSize);
 
+// --- Thread, context & snapshot helpers (implemented in platform_macos.mm) ---
+
+HANDLE GetCurrentThread();
+BOOL   DuplicateHandle(HANDLE hSourceProcessHandle, HANDLE hSourceHandle,
+                       HANDLE hTargetProcessHandle, HANDLE* lpTargetHandle,
+                       DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions);
+HANDLE CreateThread(void* lpThreadAttributes, SIZE_T dwStackSize,
+                    LPTHREAD_START_ROUTINE lpStartAddress, void* lpParameter,
+                    DWORD dwCreationFlags, DWORD* lpThreadId);
+DWORD  SuspendThread(HANDLE hThread);
+DWORD  ResumeThread(HANDLE hThread);
+BOOL   SetThreadPriority(HANDLE hThread, int nPriority);
+HANDLE OpenThread(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwThreadId);
+BOOL   GetThreadContext(HANDLE hThread, CONTEXT* lpContext);
+BOOL   SetThreadContext(HANDLE hThread, const CONTEXT* lpContext);
+BOOL   GetThreadTimes(HANDLE hThread, FILETIME* lpCreationTime, FILETIME* lpExitTime,
+                      FILETIME* lpKernelTime, FILETIME* lpUserTime);
+HANDLE CreateToolhelp32Snapshot(DWORD dwFlags, DWORD th32ProcessID);
+BOOL   Thread32First(HANDLE hSnapshot, THREADENTRY32* lpte);
+BOOL   Thread32Next(HANDLE hSnapshot, THREADENTRY32* lpte);
+
 #endif // _WIN32
 
 namespace Platform
@@ -798,6 +857,10 @@ namespace Platform
     // double-counting overlapping demand commits.
     bool CommitExternalRange(void* lpAddress, size_t dwSize, DWORD flProtect, size_t& outNewlyCommittedBytes) noexcept;
     bool IsExternalAddressCommitted(const void* lpAddress) noexcept;
+
+    // Async-signal-safe kernel read (mach_vm_read_overwrite) that never raises
+    // SIGBUS/SIGSEGV on unmapped or stale stack frame pointers.
+    bool SafeReadMemory(const void* src, void* dst, size_t size) noexcept;
 
     inline int g_originalStdoutFd = -1;
     inline int g_originalStderrFd = -1;

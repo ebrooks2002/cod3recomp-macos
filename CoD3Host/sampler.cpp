@@ -23,8 +23,14 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
 #include <Windows.h>
 #include <TlHelp32.h>
+#else
+#include "platform.h"
+#include <dlfcn.h>
+#include <libunwind.h>
+#endif
 
 namespace
 {
@@ -35,6 +41,7 @@ namespace
     };
 
     std::vector<HostFunction> g_functions;   // sorted by host address
+    uintptr_t g_recompCodeStart = UINTPTR_MAX;
     std::atomic<bool> g_running{ false };
     std::thread g_thread;
 
@@ -44,12 +51,37 @@ namespace
 
         for (size_t i = 0; PPCFuncMappings[i].guest != 0; i++)
         {
-            g_functions.push_back({
-                reinterpret_cast<uintptr_t>(PPCFuncMappings[i].host),
-                static_cast<uint32_t>(PPCFuncMappings[i].guest) });
+            const uintptr_t hostAddr  = reinterpret_cast<uintptr_t>(PPCFuncMappings[i].host);
+            const uint32_t  guestAddr = static_cast<uint32_t>(PPCFuncMappings[i].guest);
+            g_functions.push_back({ hostAddr, guestAddr });
+
+#if defined(__aarch64__)
+            // In CoD3RecompLib, PPC_WEAK_FUNC(sub_82XXXXXX) is emitted right after
+            // PPC_FUNC_IMPL(__imp__sub_82XXXXXX) and compiles to a single `b __imp__sub_82XXXXXX`
+            // instruction at offset 0. Register `__imp__sub_82XXXXXX` as well so return addresses
+            // inside `__imp__sub_82XXXXXX` resolve to `sub_82XXXXXX`.
+            if (guestAddr < 0x8257835Cu)
+            {
+                const uint32_t insn0 = *reinterpret_cast<const uint32_t*>(hostAddr);
+                if ((insn0 & 0xFC000000u) == 0x14000000u) // unconditional b imm26
+                {
+                    const int64_t offset = static_cast<int64_t>(static_cast<int32_t>(insn0 << 6)) >> 4;
+                    const uintptr_t target = static_cast<uintptr_t>(static_cast<int64_t>(hostAddr) + offset);
+                    g_functions.push_back({ target, guestAddr });
+                    if (target < g_recompCodeStart)
+                        g_recompCodeStart = target;
+                }
+            }
+#endif
         }
         std::sort(g_functions.begin(), g_functions.end(),
-            [](const HostFunction& a, const HostFunction& b) { return a.host < b.host; });
+            [](const HostFunction& a, const HostFunction& b) {
+                return a.host != b.host ? (a.host < b.host) : (a.guest < b.guest);
+            });
+        g_functions.erase(
+            std::unique(g_functions.begin(), g_functions.end(),
+                [](const HostFunction& a, const HostFunction& b) { return a.host == b.host; }),
+            g_functions.end());
     }
 
     // The guest function a host address falls inside, or zero when the address
@@ -66,6 +98,24 @@ namespace
         // Recompiled functions are large but not unbounded. A hit far past a
         // function start is host code that happens to sit after it.
         if (address - it->host > (1u << 20)) return 0;
+
+#ifndef _WIN32
+        if (it->host < g_recompCodeStart && (address - it->host) > 0x1000u)
+            return 0;
+
+        if (it->host < g_recompCodeStart ||
+            (it + 1) == g_functions.end() ||
+            ((it + 1)->host - it->host) > 0x4000u)
+        {
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<const void*>(address), &info) != 0 && info.dli_saddr != nullptr)
+            {
+                const uintptr_t symStart = reinterpret_cast<uintptr_t>(info.dli_saddr);
+                if (symStart != it->host)
+                    return 0;
+            }
+        }
+#endif
         return it->guest;
     }
 
@@ -86,6 +136,7 @@ namespace
     // a thread that has moved on can point anywhere.
     void UnwindFrames(CONTEXT* context, uint32_t* frames, int& count, int limit)
     {
+#ifdef _WIN32
         __try
         {
             for (int depth = 0; depth < 64 && count < limit; depth++)
@@ -114,6 +165,44 @@ namespace
             // The snapshot was stale; what was collected before it went
             // wrong is still a sample.
         }
+#else
+        if (!context || !frames || limit <= 0)
+            return;
+
+        constexpr uintptr_t PtrMask = 0x0000FFFFFFFFFFFFULL;
+        auto recordAddress = [&](uintptr_t addr) {
+            if (addr == 0 || count >= limit) return;
+            const uint32_t guest = GuestFunctionAt(addr & PtrMask);
+            if (guest != 0 && (count == 0 || frames[count - 1] != guest))
+                frames[count++] = guest;
+        };
+
+        recordAddress(static_cast<uintptr_t>(context->Rip));
+        if (context->Lr > 4)
+            recordAddress(static_cast<uintptr_t>(context->Lr - 4));
+
+        uintptr_t fp = static_cast<uintptr_t>(context->Rbp) & PtrMask;
+        for (int depth = 0; depth < 64 && count < limit; depth++)
+        {
+            if (fp == 0 || (fp & 0x7) != 0)
+                break;
+
+            uint64_t frameRecord[2] = {};
+            if (!Platform::SafeReadMemory(reinterpret_cast<const void*>(fp), frameRecord, sizeof(frameRecord)))
+                break;
+
+            const uintptr_t nextFp = static_cast<uintptr_t>(frameRecord[0]) & PtrMask;
+            const uintptr_t savedLr = static_cast<uintptr_t>(frameRecord[1]) & PtrMask;
+            if (savedLr <= 4)
+                break;
+
+            recordAddress(savedLr - 4);
+
+            if (nextFp <= fp || (nextFp - fp) > (16u << 20))
+                break;
+            fp = nextFp;
+        }
+#endif
     }
 
     void WalkStack(HANDLE thread, uint32_t* frames, int& count, int limit)
@@ -346,6 +435,9 @@ uint32_t Sampler::FunctionAt(unsigned long long hostAddress)
 
 int Sampler::WalkGuestStack(void* winContext, uint32_t* functions, int limit)
 {
+    if (!winContext || !functions || limit <= 0)
+        return 0;
+
     BuildFunctionMap();
 
     // The handler's context is the state at the fault, so it is walked in
@@ -353,6 +445,7 @@ int Sampler::WalkGuestStack(void* winContext, uint32_t* functions, int limit)
     CONTEXT context = *static_cast<CONTEXT*>(winContext);
     int count = 0;
 
+#ifdef _WIN32
     for (int depth = 0; depth < 64 && count < limit; depth++)
     {
         const uint32_t guest = GuestFunctionAt(static_cast<uintptr_t>(context.Rip));
@@ -369,11 +462,45 @@ int Sampler::WalkGuestStack(void* winContext, uint32_t* functions, int limit)
             &context, &handlerData, &establisherFrame, nullptr);
         if (context.Rip == 0) break;
     }
+#else
+    UnwindFrames(&context, functions, count, limit);
+#endif
     return count;
 }
 
 int Sampler::FunctionsOnStack(uint32_t* functions, int limit)
 {
+    if (!functions || limit <= 0)
+        return 0;
+
+#ifndef _WIN32
+    BuildFunctionMap();
+    unw_context_t uc{};
+    unw_cursor_t cursor{};
+    if (unw_getcontext(&uc) == 0 && unw_init_local(&cursor, &uc) == 0)
+    {
+        constexpr uintptr_t PtrMask = 0x0000FFFFFFFFFFFFULL;
+        int count = 0;
+        for (int depth = 0; depth < 64 && count < limit; ++depth)
+        {
+            unw_word_t ip = 0;
+            if (unw_get_reg(&cursor, UNW_REG_IP, &ip) == 0 && ip > 4)
+            {
+                const uintptr_t lookupAddr = (depth == 0)
+                    ? (static_cast<uintptr_t>(ip) & PtrMask)
+                    : ((static_cast<uintptr_t>(ip) & PtrMask) - 4);
+                const uint32_t guest = GuestFunctionAt(lookupAddr);
+                if (guest != 0 && (count == 0 || functions[count - 1] != guest))
+                    functions[count++] = guest;
+            }
+            if (unw_step(&cursor) <= 0)
+                break;
+        }
+        if (count > 0)
+            return count;
+    }
+#endif
+
     CONTEXT context{};
     RtlCaptureContext(&context);
     return WalkGuestStack(&context, functions, limit);
