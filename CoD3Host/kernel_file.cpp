@@ -250,11 +250,17 @@ namespace
     // enough. This falls back to a directory scan when it is not.
     fs::path FindExisting(const fs::path& wanted)
     {
+        if (wanted.empty()) return {};
         std::error_code ec;
         if (fs::exists(wanted, ec)) return wanted;
 
-        const fs::path parent = wanted.parent_path();
-        if (!fs::is_directory(parent, ec)) return {};
+        fs::path parent = wanted.parent_path();
+        if (parent.empty() || parent == wanted) return {};
+        if (!fs::is_directory(parent, ec))
+        {
+            parent = FindExisting(parent);
+            if (parent.empty() || !fs::is_directory(parent, ec)) return {};
+        }
 
         const std::string name = wanted.filename().string();
         for (const auto& entry : fs::directory_iterator(parent, ec))

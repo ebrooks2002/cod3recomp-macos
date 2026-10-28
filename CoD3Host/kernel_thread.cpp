@@ -19,7 +19,11 @@
 #include <thread>
 #include <chrono>
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include "platform.h"
+#endif
 
 namespace
 {
@@ -55,6 +59,7 @@ namespace
         // credit spends it instead of sleeping.
         bool parking = false;       // between deciding to suspend and suspending
         int resumeCredits = 0;      // resumes that arrived early
+        int externalSuspends = 0;   // CREATE_SUSPENDED or non-self NtSuspendThread
 
         // Where this thread lives in guest memory.
         //
@@ -267,35 +272,35 @@ PPC_FUNC(__imp__ExCreateThread)
     fflush(stdout);
 
     DWORD hostId = 0;
-    // Sixteen megabytes of host stack, reserved not committed: a guest call
-    // is a host call, so a level script that recurses deeply on its own
-    // megabyte of guest stack recurses just as deeply on the host's, and a
-    // host stack that runs out past its guard page ends the process with
-    // no exception anyone gets to see.
-    HANDLE host = CreateThread(nullptr, 16u << 20, ThreadEntry, arguments,
-        ((creationFlags & CreateSuspended) ? CREATE_SUSPENDED : 0) | STACK_SIZE_PARAM_IS_A_RESERVATION, &hostId);
-
-
-    if (host == nullptr)
-    {
-        delete arguments;
-        fprintf(stderr, "ExCreateThread: CreateThread failed with %lu\n", GetLastError());
-        ctx.r3.u32 = X_STATUS_NO_MEMORY;
-        return;
-    }
-
+    uint32_t handle = 0;
     GuestThread thread;
-    thread.host = host;
-    thread.id = g_nextThreadId++;
-    thread.osId = hostId;
-    thread.stackTop = stackTop;
-    thread.startAddress = startAddress;
-    thread.startContext = startContext;
-    thread.xapiStartup = xapiStartup;
-
-    uint32_t handle;
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
+        // Sixteen megabytes of host stack, reserved not committed: a guest call
+        // is a host call, so a level script that recurses deeply on its own
+        // megabyte of guest stack recurses just as deeply on the host's, and a
+        // host stack that runs out past its guard page ends the process with
+        // no exception anyone gets to see.
+        HANDLE host = CreateThread(nullptr, 16u << 20, ThreadEntry, arguments,
+            ((creationFlags & CreateSuspended) ? CREATE_SUSPENDED : 0) | STACK_SIZE_PARAM_IS_A_RESERVATION, &hostId);
+
+        if (host == nullptr)
+        {
+            delete arguments;
+            fprintf(stderr, "ExCreateThread: CreateThread failed with %lu\n", GetLastError());
+            ctx.r3.u32 = X_STATUS_NO_MEMORY;
+            return;
+        }
+
+        thread.host = host;
+        thread.id = g_nextThreadId++;
+        thread.osId = hostId;
+        thread.stackTop = stackTop;
+        thread.startAddress = startAddress;
+        thread.startContext = startContext;
+        thread.xapiStartup = xapiStartup;
+        thread.externalSuspends = (creationFlags & CreateSuspended) ? 1 : 0;
+
         handle = g_nextThreadHandle;
         g_nextThreadHandle += 4;
 
@@ -373,7 +378,7 @@ PPC_FUNC(__imp__NtResumeThread)
     Kernel::CountImport("NtResumeThread");
     HANDLE host = nullptr;
     bool parking = false;
-    bool credited = false;
+    DWORD previous = 0;
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
         GuestThread* thread = FindThread(ctx.r3.u32);
@@ -385,14 +390,19 @@ PPC_FUNC(__imp__NtResumeThread)
             {
                 thread->parking = false;
             }
+            else if (thread->externalSuspends > 0 && host != nullptr)
+            {
+                // External suspensions are applied natively under this lock
+                // (see NtSuspendThread), so the count and the native suspend
+                // count agree here and the resume is never spent early.
+                thread->externalSuspends--;
+                previous = ResumeThread(host);
+            }
             else if (thread->osId != 0 && thread->osId != GetCurrentThreadId())
             {
-                // Not parking and, if it is not suspended either, the resume
-                // would be lost; the credit is spent by its next self suspend.
-                // A thread still suspended from its creation is resumed for
-                // real below and the credit taken back.
+                // Not parking and not externally suspended: the resume arrived
+                // before the worker's next self suspend, so bank it as a credit.
                 thread->resumeCredits++;
-                credited = true;
             }
         }
     }
@@ -404,23 +414,16 @@ PPC_FUNC(__imp__NtResumeThread)
         return;
     }
 
-    DWORD previous = ResumeThread(host);
     if (parking)
     {
         // The thread said it was about to suspend; if it has not yet, the
         // resume did nothing and is tried again until it has.
+        previous = ResumeThread(host);
         while (previous == 0)
         {
             std::this_thread::yield();
             previous = ResumeThread(host);
         }
-    }
-    else if (credited && previous != DWORD(-1) && previous != 0)
-    {
-        // It was suspended after all, so the resume counted; no credit.
-        std::lock_guard<std::mutex> lock(g_threadsMutex);
-        GuestThread* thread = FindThread(ctx.r3.u32);
-        if (thread != nullptr && thread->resumeCredits > 0) thread->resumeCredits--;
     }
     if (ctx.r4.u32 != 0 && previous != DWORD(-1))
         Guest::Write32(base, ctx.r4.u32, previous);
@@ -441,6 +444,7 @@ PPC_FUNC(__imp__NtSuspendThread)
     HANDLE host = nullptr;
     bool self = false;
     bool spentCredit = false;
+    DWORD previous = 0;
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
         GuestThread* thread = FindThread(ctx.r3.u32);
@@ -459,9 +463,19 @@ PPC_FUNC(__imp__NtSuspendThread)
                 thread->parking = true;
             }
         }
+        else
+        {
+            // Suspending another thread does not block this one, and the
+            // target cannot be holding this lock while we do, so the native
+            // suspension is applied here: publishing the count and applying
+            // it together means a concurrent NtResumeThread cannot consume
+            // the count before the suspension it stands for has taken effect.
+            previous = SuspendThread(host);
+            if (previous != DWORD(-1))
+                thread->externalSuspends++;
+        }
     }
 
-    DWORD previous;
     static const bool noPark = getenv("COD3_NOPARK") != nullptr;
     if (self && (spentCredit || noPark))
     {
@@ -486,13 +500,6 @@ PPC_FUNC(__imp__NtSuspendThread)
         Scheduler::Release();
         previous = SuspendThread(GetCurrentThread());
         Scheduler::Acquire();
-        std::lock_guard<std::mutex> lock(g_threadsMutex);
-        GuestThread* thread = FindThread(ctx.r3.u32);
-        if (thread != nullptr) thread->parking = false;
-    }
-    else
-    {
-        previous = SuspendThread(host);
     }
     if (ctx.r4.u32 != 0 && previous != DWORD(-1))
         Guest::Write32(base, ctx.r4.u32, previous);
@@ -595,7 +602,12 @@ void Kernel::SignalThreadExit(uint32_t osId)
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
         for (auto& entry : g_threads)
-            if (entry.second.osId == osId) { object = entry.second.guestObject; break; }
+            if (entry.second.osId == osId)
+            {
+                object = entry.second.guestObject;
+                entry.second.host = nullptr;
+                break;
+            }
     }
     if (object == 0) return;
 

@@ -21,8 +21,12 @@
 #include <set>
 #include <vector>
 
+#ifdef _WIN32
 #include <Windows.h>
 #include <TlHelp32.h>
+#else
+#include "platform.h"
+#endif
 
 namespace
 {
@@ -187,6 +191,19 @@ bool Kernel::ReportWatchpoint(void* winContext)
     // write that expects to be counted. Only the printing is filtered.
     const int report = g_reports.fetch_add(1);
 
+#ifndef _WIN32
+    // On ARM64, a hardware watchpoint trap stops before/at the instruction;
+    // clear the current thread's watchpoint control register so resuming does
+    // not immediately re-trap on the same store.
+    {
+        CONTEXT disarm{};
+        disarm.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        disarm.Dr0 = 0;
+        disarm.Dr7 = 0;
+        SetThreadContext(GetCurrentThread(), &disarm);
+    }
+#endif
+
     uint32_t functions[12] = {};
     const int count = Sampler::WalkGuestStack(winContext, functions, 12);
 
@@ -224,7 +241,7 @@ bool Kernel::ReportWatchpoint(void* winContext)
         const CONTEXT* context = static_cast<const CONTEXT*>(winContext);
         const uint32_t function = Sampler::FunctionAt(context->Rip);
         const PPCContext* guest = Kernel::ContextOf(GetCurrentThreadId());
-        printf("  written by sub_%08X, os thread %lu, lr 0x%08X\n", function, GetCurrentThreadId(),
+        printf("  written by sub_%08X, os thread %lu, lr 0x%08X\n", function, (unsigned long)GetCurrentThreadId(),
             guest ? uint32_t(guest->lr) : 0);
     }
     fflush(stdout);
