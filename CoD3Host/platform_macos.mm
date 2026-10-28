@@ -966,9 +966,21 @@ DWORD ResumeThread(HANDLE hThread)
     if (port == MACH_PORT_NULL)
         return DWORD(-1);
 
+    // Win32 returns the suspend count from before the resume.
+    DWORD prevCount = 0;
+    thread_basic_info_data_t basicInfo{};
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO,
+                    reinterpret_cast<thread_info_t>(&basicInfo), &count) == KERN_SUCCESS)
+    {
+        prevCount = basicInfo.suspend_count > 0 ? static_cast<DWORD>(basicInfo.suspend_count) : 0;
+    }
+
     const kern_return_t kr = thread_resume(port);
     if (kr == KERN_SUCCESS)
-        return 1;
+        // A suspension that landed between the query and the resume still
+        // means the thread was suspended at least once.
+        return prevCount > 0 ? prevCount : 1;
     if (kr == KERN_FAILURE)
         return 0;
     return DWORD(-1);
@@ -1026,7 +1038,10 @@ BOOL GetThreadContext(HANDLE hThread, CONTEXT* lpContext)
     if (port == MACH_PORT_NULL) return FALSE;
 
 #if defined(__aarch64__)
-    if (lpContext->ContextFlags == 0 || (lpContext->ContextFlags & CONTEXT_FULL) != 0)
+    // CONTEXT_FULL and CONTEXT_DEBUG_REGISTERS share the architecture bit, so
+    // the requested parts are tested with it masked off.
+    const DWORD requested = lpContext->ContextFlags & ~ContextArchitectureBit;
+    if (lpContext->ContextFlags == 0 || (requested & ContextCoreMask) != 0)
     {
         arm_thread_state64_t state{};
         mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
@@ -1043,7 +1058,7 @@ BOOL GetThreadContext(HANDLE hThread, CONTEXT* lpContext)
         lpContext->Rip = arm_thread_state64_get_pc(state);
     }
 
-    if (lpContext->ContextFlags & CONTEXT_DEBUG_REGISTERS)
+    if (requested & ContextDebugMask)
     {
         arm_debug_state64_t dbg{};
         mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
@@ -1067,7 +1082,12 @@ BOOL SetThreadContext(HANDLE hThread, const CONTEXT* lpContext)
     if (port == MACH_PORT_NULL) return FALSE;
 
 #if defined(__aarch64__)
-    if (lpContext->ContextFlags & CONTEXT_DEBUG_REGISTERS)
+    const DWORD requested = lpContext->ContextFlags & ~ContextArchitectureBit;
+    // Core-register writeback (PC, SP, general registers) is not implemented;
+    // refuse it rather than report a success that changed nothing.
+    if ((requested & ContextCoreMask) != 0)
+        return FALSE;
+    if (requested & ContextDebugMask)
     {
         arm_debug_state64_t dbg{};
         mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;

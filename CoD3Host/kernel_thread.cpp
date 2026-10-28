@@ -378,7 +378,7 @@ PPC_FUNC(__imp__NtResumeThread)
     Kernel::CountImport("NtResumeThread");
     HANDLE host = nullptr;
     bool parking = false;
-    bool externallySuspended = false;
+    DWORD previous = 0;
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
         GuestThread* thread = FindThread(ctx.r3.u32);
@@ -390,10 +390,13 @@ PPC_FUNC(__imp__NtResumeThread)
             {
                 thread->parking = false;
             }
-            else if (thread->externalSuspends > 0)
+            else if (thread->externalSuspends > 0 && host != nullptr)
             {
+                // External suspensions are applied natively under this lock
+                // (see NtSuspendThread), so the count and the native suspend
+                // count agree here and the resume is never spent early.
                 thread->externalSuspends--;
-                externallySuspended = true;
+                previous = ResumeThread(host);
             }
             else if (thread->osId != 0 && thread->osId != GetCurrentThreadId())
             {
@@ -411,7 +414,6 @@ PPC_FUNC(__imp__NtResumeThread)
         return;
     }
 
-    DWORD previous = 0;
     if (parking)
     {
         // The thread said it was about to suspend; if it has not yet, the
@@ -422,10 +424,6 @@ PPC_FUNC(__imp__NtResumeThread)
             std::this_thread::yield();
             previous = ResumeThread(host);
         }
-    }
-    else if (externallySuspended)
-    {
-        previous = ResumeThread(host);
     }
     if (ctx.r4.u32 != 0 && previous != DWORD(-1))
         Guest::Write32(base, ctx.r4.u32, previous);
@@ -446,6 +444,7 @@ PPC_FUNC(__imp__NtSuspendThread)
     HANDLE host = nullptr;
     bool self = false;
     bool spentCredit = false;
+    DWORD previous = 0;
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
         GuestThread* thread = FindThread(ctx.r3.u32);
@@ -466,11 +465,17 @@ PPC_FUNC(__imp__NtSuspendThread)
         }
         else
         {
-            thread->externalSuspends++;
+            // Suspending another thread does not block this one, and the
+            // target cannot be holding this lock while we do, so the native
+            // suspension is applied here: publishing the count and applying
+            // it together means a concurrent NtResumeThread cannot consume
+            // the count before the suspension it stands for has taken effect.
+            previous = SuspendThread(host);
+            if (previous != DWORD(-1))
+                thread->externalSuspends++;
         }
     }
 
-    DWORD previous;
     static const bool noPark = getenv("COD3_NOPARK") != nullptr;
     if (self && (spentCredit || noPark))
     {
@@ -495,10 +500,6 @@ PPC_FUNC(__imp__NtSuspendThread)
         Scheduler::Release();
         previous = SuspendThread(GetCurrentThread());
         Scheduler::Acquire();
-    }
-    else
-    {
-        previous = SuspendThread(host);
     }
     if (ctx.r4.u32 != 0 && previous != DWORD(-1))
         Guest::Write32(base, ctx.r4.u32, previous);

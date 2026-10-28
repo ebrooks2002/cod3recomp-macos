@@ -14,6 +14,12 @@
 #include <unistd.h>
 #endif
 
+#if !defined(_WIN32) && !defined(__aarch64__)
+// The macOS host targets Apple silicon only: the fiber switcher below is
+// hand-written ARM64 and there is no x86_64 fallback.
+#error "The non-Windows coroutine implementation requires an ARM64 (aarch64) host."
+#endif
+
 namespace
 {
 #ifndef _WIN32
@@ -33,6 +39,10 @@ namespace
         double   d10, d11;
         double   d12, d13;
         double   d14, d15;
+        // Floating-point control/status (FIBER_FLAG_FLOAT_SWITCH): the guest
+        // FPSCR is backed by the host FPCR, so rounding and flush-to-zero
+        // modes belong to each coroutine, not the thread.
+        uint64_t fpcr, fpsr;
     };
 
     static_assert(offsetof(FiberContext, x19) == 0x00, "x19 offset mismatch");
@@ -40,8 +50,8 @@ namespace
     static_assert(offsetof(FiberContext, sp)  == 0x60, "sp offset mismatch");
     static_assert(offsetof(FiberContext, d8)  == 0x70, "d8 offset mismatch");
     static_assert(offsetof(FiberContext, d14) == 0xA0, "d14 offset mismatch");
+    static_assert(offsetof(FiberContext, fpcr) == 0xB0, "fpcr offset mismatch");
 
-#if defined(__aarch64__)
     __attribute__((naked, noinline))
     void aarch64_switch_fiber(FiberContext* /*from*/, const FiberContext* /*to*/)
     {
@@ -58,6 +68,9 @@ namespace
             "stp d10, d11, [x0, #0x80]\n"
             "stp d12, d13, [x0, #0x90]\n"
             "stp d14, d15, [x0, #0xA0]\n"
+            "mrs x2, fpcr\n"
+            "mrs x3, fpsr\n"
+            "stp x2, x3,   [x0, #0xB0]\n"
 
             "ldp x19, x20, [x1, #0x00]\n"
             "ldp x21, x22, [x1, #0x10]\n"
@@ -71,6 +84,9 @@ namespace
             "ldp d10, d11, [x1, #0x80]\n"
             "ldp d12, d13, [x1, #0x90]\n"
             "ldp d14, d15, [x1, #0xA0]\n"
+            "ldp x2, x3,   [x1, #0xB0]\n"
+            "msr fpcr, x2\n"
+            "msr fpsr, x3\n"
             "ret\n"
         );
     }
@@ -86,7 +102,6 @@ namespace
             "brk #1\n"
         );
     }
-#endif
 
     struct MacFiber
     {
@@ -146,6 +161,10 @@ namespace
         fiber->context.x29 = 0;
         fiber->context.x30 = reinterpret_cast<uint64_t>(&aarch64_fiber_trampoline);
         fiber->context.sp  = initialSp;
+        // A new fiber starts with the creating thread's floating-point
+        // environment, as a Windows fiber created with FIBER_FLAG_FLOAT_SWITCH does.
+        fiber->context.fpcr = __builtin_arm_rsr64("fpcr");
+        fiber->context.fpsr = __builtin_arm_rsr64("fpsr");
         return fiber;
     }
 
@@ -156,9 +175,7 @@ namespace
         if (!target || !current || target == current)
             return;
         t_activeFiber = target;
-#if defined(__aarch64__)
         aarch64_switch_fiber(&current->context, &target->context);
-#endif
     }
 
     void DeleteFiber(void* lpFiber) noexcept

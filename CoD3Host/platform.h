@@ -361,6 +361,12 @@ struct CONTEXT
 inline constexpr DWORD CONTEXT_FULL            = 0x00100007u;
 inline constexpr DWORD CONTEXT_DEBUG_REGISTERS = 0x00100010u;
 
+// The architecture bit both flags above carry, and the parts they request
+// with it masked off: test a request against these, not the full constants.
+inline constexpr DWORD ContextArchitectureBit  = 0x00100000u;
+inline constexpr DWORD ContextCoreMask         = CONTEXT_FULL & ~ContextArchitectureBit;
+inline constexpr DWORD ContextDebugMask        = CONTEXT_DEBUG_REGISTERS & ~ContextArchitectureBit;
+
 using LPTHREAD_START_ROUTINE = DWORD (WINAPI *)(void*);
 
 inline constexpr DWORD CREATE_SUSPENDED                  = 0x00000004u;
