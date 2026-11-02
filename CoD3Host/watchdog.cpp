@@ -24,11 +24,17 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef _WIN32
 #include <Windows.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
 
 #pragma comment(lib, "dbghelp.lib")
+#else
+#include "platform.h"
+#include <cxxabi.h>
+#include <dlfcn.h>
+#endif
 
 namespace
 {
@@ -54,7 +60,7 @@ namespace
         }
         if (!captured) { CloseHandle(thread); return; }
 
-        printf("  thread %5lu:", threadId);
+        printf("  thread %5lu:", (unsigned long)threadId);
         Kernel::SetUnwinding(true);
         WalkFrames(process, thread, context);
         Kernel::SetUnwinding(false);
@@ -64,6 +70,7 @@ namespace
 
     void PrintFrame(HANDLE process, DWORD64 pc)
     {
+#ifdef _WIN32
         char buffer[sizeof(SYMBOL_INFO) + 256] = {};
         auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
         symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
@@ -99,10 +106,33 @@ namespace
                 snprintf(name, sizeof(name), "%s", info.ModuleName);
         }
         printf(" %s!%llx", name, (unsigned long long)(pc - module));
+#else
+        (void)process;
+        if (const uint32_t guest = Sampler::FunctionAt(pc))
+        {
+            printf(" sub_%08X", guest);
+            return;
+        }
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<const void*>(static_cast<uintptr_t>(pc)), &info) != 0 &&
+            info.dli_sname != nullptr)
+        {
+            int status = 0;
+            char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+            const char* symName = (status == 0 && demangled != nullptr) ? demangled : info.dli_sname;
+            const auto offset = static_cast<unsigned long long>(
+                pc - reinterpret_cast<uintptr_t>(info.dli_saddr));
+            printf(" %s+0x%llx", symName, offset);
+            if (demangled) free(demangled);
+            return;
+        }
+        printf(" 0x%llx", (unsigned long long)pc);
+#endif
     }
 
     void WalkFrames(HANDLE process, HANDLE thread, CONTEXT& context)
     {
+#ifdef _WIN32
         STACKFRAME64 frame{};
         frame.AddrPC.Offset = context.Rip;
         frame.AddrPC.Mode = AddrModeFlat;
@@ -126,6 +156,30 @@ namespace
         {
             printf(" (walk faulted)");
         }
+#else
+        (void)thread;
+        constexpr uintptr_t PtrMask = 0x0000FFFFFFFFFFFFULL;
+        if (context.Rip != 0)
+            PrintFrame(process, context.Rip & PtrMask);
+
+        uintptr_t fp = static_cast<uintptr_t>(context.Rbp) & PtrMask;
+        for (int depth = 0; depth < 24; depth++)
+        {
+            if (fp == 0 || (fp & 0x7) != 0)
+                break;
+            uint64_t frameRecord[2] = {};
+            if (!Platform::SafeReadMemory(reinterpret_cast<const void*>(fp), frameRecord, sizeof(frameRecord)))
+                break;
+            const uintptr_t nextFp = static_cast<uintptr_t>(frameRecord[0]) & PtrMask;
+            const uintptr_t savedLr = static_cast<uintptr_t>(frameRecord[1]) & PtrMask;
+            if (savedLr <= 4)
+                break;
+            PrintFrame(process, static_cast<DWORD64>(savedLr - 4));
+            if (nextFp <= fp || (nextFp - fp) > (16u << 20))
+                break;
+            fp = nextFp;
+        }
+#endif
     }
 
     // DbgHelp is not made for more than one thread at a time.
@@ -133,6 +187,7 @@ namespace
 
     void LoadSymbols(HANDLE process)
     {
+#ifdef _WIN32
         std::lock_guard<std::recursive_mutex> lock(g_symbolsLock);
         static bool symbols = false;
         if (!symbols)
@@ -140,6 +195,9 @@ namespace
             SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
             symbols = SymInitialize(process, nullptr, TRUE) != FALSE;
         }
+#else
+        (void)process;
+#endif
     }
 
     void DumpAllThreads()
@@ -249,6 +307,7 @@ namespace
     // after it runs on (a stale stack costs one wrong sample at worst).
     void FunctionsOf(CONTEXT* context, DWORD64* starts, int& count, int limit)
     {
+#ifdef _WIN32
         __try
         {
             for (int depth = 0; depth < 64 && count < limit; depth++)
@@ -276,10 +335,45 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
         }
+#else
+        if (!context || !starts || limit <= 0)
+            return;
+        constexpr uintptr_t PtrMask = 0x0000FFFFFFFFFFFFULL;
+        auto resolveStart = [](uintptr_t pc) -> DWORD64 {
+            pc &= PtrMask;
+            if (pc == 0) return 0;
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<const void*>(pc), &info) != 0 && info.dli_saddr != nullptr)
+                return static_cast<DWORD64>(reinterpret_cast<uintptr_t>(info.dli_saddr));
+            return static_cast<DWORD64>(pc);
+        };
+
+        if (context->Rip != 0 && count < limit)
+            starts[count++] = resolveStart(static_cast<uintptr_t>(context->Rip));
+
+        uintptr_t fp = static_cast<uintptr_t>(context->Rbp) & PtrMask;
+        for (int depth = 0; depth < 64 && count < limit; depth++)
+        {
+            if (fp == 0 || (fp & 0x7) != 0)
+                break;
+            uint64_t frameRecord[2] = {};
+            if (!Platform::SafeReadMemory(reinterpret_cast<const void*>(fp), frameRecord, sizeof(frameRecord)))
+                break;
+            const uintptr_t nextFp = static_cast<uintptr_t>(frameRecord[0]) & PtrMask;
+            const uintptr_t savedLr = static_cast<uintptr_t>(frameRecord[1]) & PtrMask;
+            if (savedLr <= 4)
+                break;
+            starts[count++] = resolveStart(savedLr - 4);
+            if (nextFp <= fp || (nextFp - fp) > (16u << 20))
+                break;
+            fp = nextFp;
+        }
+#endif
     }
 
     std::string FunctionName(HANDLE process, DWORD64 start)
     {
+#ifdef _WIN32
         std::lock_guard<std::recursive_mutex> lock(g_symbolsLock);
         char buffer[sizeof(SYMBOL_INFO) + 256] = {};
         auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
@@ -291,11 +385,34 @@ namespace
         const DWORD64 module = SymGetModuleBase64(process, start);
         snprintf(text, sizeof(text), "%llx (+%llx)", (unsigned long long)start, (unsigned long long)(start - module));
         return text;
+#else
+        (void)process;
+        if (const uint32_t guest = Sampler::FunctionAt(start))
+        {
+            char text[32];
+            snprintf(text, sizeof(text), "sub_%08X", guest);
+            return text;
+        }
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<const void*>(static_cast<uintptr_t>(start)), &info) != 0 &&
+            info.dli_sname != nullptr)
+        {
+            int status = 0;
+            char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+            std::string out = (status == 0 && demangled != nullptr) ? demangled : info.dli_sname;
+            if (demangled) free(demangled);
+            return out;
+        }
+        char text[64];
+        snprintf(text, sizeof(text), "0x%llx", (unsigned long long)start);
+        return text;
+#endif
     }
 
     // The source line of an address: "file.cpp:123", or "" when unknown.
     std::string LineOf(HANDLE process, DWORD64 address)
     {
+#ifdef _WIN32
         std::lock_guard<std::recursive_mutex> lock(g_symbolsLock);
         IMAGEHLP_LINE64 line{};
         line.SizeOfStruct = sizeof(line);
@@ -305,6 +422,11 @@ namespace
         for (const char* p = line.FileName; *p != 0; p++)
             if (*p == '\\' || *p == '/') file = p + 1;
         return std::string(file) + ":" + std::to_string(line.LineNumber);
+#else
+        (void)process;
+        (void)address;
+        return "";
+#endif
     }
 }
 

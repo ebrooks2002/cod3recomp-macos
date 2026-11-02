@@ -1,14 +1,192 @@
 #include "coroutines.h"
 #include "kernel.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include "platform.h"
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+#if !defined(_WIN32) && !defined(__aarch64__)
+// The macOS host targets Apple silicon only: the fiber switcher below is
+// hand-written ARM64 and there is no x86_64 fallback.
+#error "The non-Windows coroutine implementation requires an ARM64 (aarch64) host."
+#endif
 
 namespace
 {
+#ifndef _WIN32
+    constexpr DWORD FIBER_FLAG_FLOAT_SWITCH = 0x1;
+    using LPFIBER_START_ROUTINE = void (CALLBACK *)(void*);
+
+    struct alignas(16) FiberContext
+    {
+        uint64_t x19, x20;
+        uint64_t x21, x22;
+        uint64_t x23, x24;
+        uint64_t x25, x26;
+        uint64_t x27, x28;
+        uint64_t x29, x30; // fp, lr
+        uint64_t sp, pad;
+        double   d8,  d9;
+        double   d10, d11;
+        double   d12, d13;
+        double   d14, d15;
+        // Floating-point control/status (FIBER_FLAG_FLOAT_SWITCH): the guest
+        // FPSCR is backed by the host FPCR, so rounding and flush-to-zero
+        // modes belong to each coroutine, not the thread.
+        uint64_t fpcr, fpsr;
+    };
+
+    static_assert(offsetof(FiberContext, x19) == 0x00, "x19 offset mismatch");
+    static_assert(offsetof(FiberContext, x29) == 0x50, "x29 offset mismatch");
+    static_assert(offsetof(FiberContext, sp)  == 0x60, "sp offset mismatch");
+    static_assert(offsetof(FiberContext, d8)  == 0x70, "d8 offset mismatch");
+    static_assert(offsetof(FiberContext, d14) == 0xA0, "d14 offset mismatch");
+    static_assert(offsetof(FiberContext, fpcr) == 0xB0, "fpcr offset mismatch");
+
+    __attribute__((naked, noinline))
+    void aarch64_switch_fiber(FiberContext* /*from*/, const FiberContext* /*to*/)
+    {
+        __asm__ volatile(
+            "stp x19, x20, [x0, #0x00]\n"
+            "stp x21, x22, [x0, #0x10]\n"
+            "stp x23, x24, [x0, #0x20]\n"
+            "stp x25, x26, [x0, #0x30]\n"
+            "stp x27, x28, [x0, #0x40]\n"
+            "stp x29, x30, [x0, #0x50]\n"
+            "mov x2, sp\n"
+            "str x2,       [x0, #0x60]\n"
+            "stp d8,  d9,  [x0, #0x70]\n"
+            "stp d10, d11, [x0, #0x80]\n"
+            "stp d12, d13, [x0, #0x90]\n"
+            "stp d14, d15, [x0, #0xA0]\n"
+            "mrs x2, fpcr\n"
+            "mrs x3, fpsr\n"
+            "stp x2, x3,   [x0, #0xB0]\n"
+
+            "ldp x19, x20, [x1, #0x00]\n"
+            "ldp x21, x22, [x1, #0x10]\n"
+            "ldp x23, x24, [x1, #0x20]\n"
+            "ldp x25, x26, [x1, #0x30]\n"
+            "ldp x27, x28, [x1, #0x40]\n"
+            "ldp x29, x30, [x1, #0x50]\n"
+            "ldr x2,       [x1, #0x60]\n"
+            "mov sp, x2\n"
+            "ldp d8,  d9,  [x1, #0x70]\n"
+            "ldp d10, d11, [x1, #0x80]\n"
+            "ldp d12, d13, [x1, #0x90]\n"
+            "ldp d14, d15, [x1, #0xA0]\n"
+            "ldp x2, x3,   [x1, #0xB0]\n"
+            "msr fpcr, x2\n"
+            "msr fpsr, x3\n"
+            "ret\n"
+        );
+    }
+
+    __attribute__((naked, noinline))
+    void aarch64_fiber_trampoline()
+    {
+        __asm__ volatile(
+            "mov x29, #0\n"
+            "mov x30, #0\n"
+            "mov x0, x20\n"
+            "blr x19\n"
+            "brk #1\n"
+        );
+    }
+
+    struct MacFiber
+    {
+        FiberContext context{};
+        void* mapping = nullptr;
+        size_t mappingSize = 0;
+        bool isThreadFiber = false;
+    };
+
+    thread_local MacFiber* t_activeFiber = nullptr;
+
+    void* GetCurrentFiber() noexcept
+    {
+        return t_activeFiber;
+    }
+
+    void* ConvertThreadToFiberEx(void*, DWORD) noexcept
+    {
+        if (t_activeFiber != nullptr)
+            return nullptr;
+        auto* fiber = new MacFiber();
+        fiber->isThreadFiber = true;
+        t_activeFiber = fiber;
+        return fiber;
+    }
+
+    void* CreateFiberEx(size_t, size_t dwStackReserve, DWORD,
+                        LPFIBER_START_ROUTINE lpStartAddress, void* lpParameter) noexcept
+    {
+        const size_t pageSize = static_cast<size_t>(getpagesize());
+        const size_t stackSize = ((dwStackReserve > 0 ? dwStackReserve : (4u << 20)) + pageSize - 1) & ~(pageSize - 1);
+        const size_t totalSize = stackSize + pageSize; // +1 guard page at low address
+
+        void* mapping = mmap(nullptr, totalSize, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (mapping == MAP_FAILED)
+            return nullptr;
+
+        if (mprotect(mapping, pageSize, PROT_NONE) != 0)
+        {
+            munmap(mapping, totalSize);
+            return nullptr;
+        }
+
+        auto* fiber = new MacFiber();
+        fiber->mapping = mapping;
+        fiber->mappingSize = totalSize;
+
+        const uintptr_t stackTop = reinterpret_cast<uintptr_t>(mapping) + totalSize;
+        const uintptr_t initialSp = (stackTop - 16) & ~uintptr_t(0xF);
+        auto* frameSentinel = reinterpret_cast<uint64_t*>(initialSp);
+        frameSentinel[0] = 0;
+        frameSentinel[1] = 0;
+
+        fiber->context.x19 = reinterpret_cast<uint64_t>(lpStartAddress);
+        fiber->context.x20 = reinterpret_cast<uint64_t>(lpParameter);
+        fiber->context.x29 = 0;
+        fiber->context.x30 = reinterpret_cast<uint64_t>(&aarch64_fiber_trampoline);
+        fiber->context.sp  = initialSp;
+        // A new fiber starts with the creating thread's floating-point
+        // environment, as a Windows fiber created with FIBER_FLAG_FLOAT_SWITCH does.
+        fiber->context.fpcr = __builtin_arm_rsr64("fpcr");
+        fiber->context.fpsr = __builtin_arm_rsr64("fpsr");
+        return fiber;
+    }
+
+    void SwitchToFiber(void* lpFiber) noexcept
+    {
+        auto* target = static_cast<MacFiber*>(lpFiber);
+        MacFiber* current = t_activeFiber;
+        if (!target || !current || target == current)
+            return;
+        t_activeFiber = target;
+        aarch64_switch_fiber(&current->context, &target->context);
+    }
+
+    void DeleteFiber(void* lpFiber) noexcept
+    {
+        auto* fiber = static_cast<MacFiber*>(lpFiber);
+        if (!fiber) return;
+        if (fiber->mapping != nullptr && fiber->mappingSize > 0)
+            munmap(fiber->mapping, fiber->mappingSize);
+        delete fiber;
+    }
+#endif
     struct Coroutine
     {
         uint32_t key = 0;

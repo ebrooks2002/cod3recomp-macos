@@ -1275,6 +1275,21 @@ bool Guest::Initialize(const char* xexPath)
     if (!Commit(FuncTableBase, FuncTableSize, "function table")) return false;
     if (!Commit(StackBase - StackSize, StackSize, "stack")) return false;
 
+    size_t entries = 0;
+    for (size_t i = 0; PPCFuncMappings[i].guest != 0; i++)
+    {
+        const size_t guest = PPCFuncMappings[i].guest;
+        if (guest < PPC_CODE_BASE || guest >= PPC_CODE_BASE + PPC_CODE_SIZE)
+        {
+            fprintf(stderr, "  function 0x%zX is outside the code range\n", guest);
+            return false;
+        }
+        auto** slot = reinterpret_cast<PPCFunc**>(
+            Base + FuncTableBase + (uint64_t(uint32_t(guest) - PPC_CODE_BASE) * 2));
+        *slot = PPCFuncMappings[i].host;
+        entries++;
+    }
+
     if (xexPath == nullptr || xexPath[0] == '\0')
         return true;
 
@@ -1333,21 +1348,6 @@ bool Guest::Initialize(const char* xexPath)
     // PPC_LOOKUP_FUNC turns a guest code address into a host function pointer
     // by indexing this table at (address - PPC_CODE_BASE) * 2.
     BindVariableImports(file.data());
-
-    size_t entries = 0;
-    for (size_t i = 0; PPCFuncMappings[i].guest != 0; i++)
-    {
-        const size_t guest = PPCFuncMappings[i].guest;
-        if (guest < PPC_CODE_BASE || guest >= PPC_CODE_BASE + PPC_CODE_SIZE)
-        {
-            fprintf(stderr, "  function 0x%zX is outside the code range\n", guest);
-            return false;
-        }
-        auto** slot = reinterpret_cast<PPCFunc**>(
-            Base + FuncTableBase + (uint64_t(uint32_t(guest) - PPC_CODE_BASE) * 2));
-        *slot = PPCFuncMappings[i].host;
-        entries++;
-    }
     printf("  %zu functions in the indirect call table\n", entries);
 
     // Import thunks are not recompiled functions, so they are absent from
@@ -1468,6 +1468,8 @@ void Kernel::FlushFaultDiagnostics()
 
 void Guest::Shutdown()
 {
+    Guest::StopThreadClock();
+    Guest::SetTimeStampBundle(0);
     Kernel::FlushFaultDiagnostics();
     if (g_reservation != nullptr)
     {

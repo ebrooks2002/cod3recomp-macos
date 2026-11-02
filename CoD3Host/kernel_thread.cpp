@@ -19,7 +19,11 @@
 #include <thread>
 #include <chrono>
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include "platform.h"
+#endif
 
 namespace
 {
@@ -55,6 +59,7 @@ namespace
         // credit spends it instead of sleeping.
         bool parking = false;       // between deciding to suspend and suspending
         int resumeCredits = 0;      // resumes that arrived early
+        int externalSuspends = 0;   // CREATE_SUSPENDED or non-self NtSuspendThread
 
         // Where this thread lives in guest memory.
         //
@@ -267,35 +272,35 @@ PPC_FUNC(__imp__ExCreateThread)
     fflush(stdout);
 
     DWORD hostId = 0;
-    // Sixteen megabytes of host stack, reserved not committed: a guest call
-    // is a host call, so a level script that recurses deeply on its own
-    // megabyte of guest stack recurses just as deeply on the host's, and a
-    // host stack that runs out past its guard page ends the process with
-    // no exception anyone gets to see.
-    HANDLE host = CreateThread(nullptr, 16u << 20, ThreadEntry, arguments,
-        ((creationFlags & CreateSuspended) ? CREATE_SUSPENDED : 0) | STACK_SIZE_PARAM_IS_A_RESERVATION, &hostId);
-
-
-    if (host == nullptr)
-    {
-        delete arguments;
-        fprintf(stderr, "ExCreateThread: CreateThread failed with %lu\n", GetLastError());
-        ctx.r3.u32 = X_STATUS_NO_MEMORY;
-        return;
-    }
-
+    uint32_t handle = 0;
     GuestThread thread;
-    thread.host = host;
-    thread.id = g_nextThreadId++;
-    thread.osId = hostId;
-    thread.stackTop = stackTop;
-    thread.startAddress = startAddress;
-    thread.startContext = startContext;
-    thread.xapiStartup = xapiStartup;
-
-    uint32_t handle;
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
+        // Sixteen megabytes of host stack, reserved not committed: a guest call
+        // is a host call, so a level script that recurses deeply on its own
+        // megabyte of guest stack recurses just as deeply on the host's, and a
+        // host stack that runs out past its guard page ends the process with
+        // no exception anyone gets to see.
+        HANDLE host = CreateThread(nullptr, 16u << 20, ThreadEntry, arguments,
+            ((creationFlags & CreateSuspended) ? CREATE_SUSPENDED : 0) | STACK_SIZE_PARAM_IS_A_RESERVATION, &hostId);
+
+        if (host == nullptr)
+        {
+            delete arguments;
+            fprintf(stderr, "ExCreateThread: CreateThread failed with %lu\n", GetLastError());
+            ctx.r3.u32 = X_STATUS_NO_MEMORY;
+            return;
+        }
+
+        thread.host = host;
+        thread.id = g_nextThreadId++;
+        thread.osId = hostId;
+        thread.stackTop = stackTop;
+        thread.startAddress = startAddress;
+        thread.startContext = startContext;
+        thread.xapiStartup = xapiStartup;
+        thread.externalSuspends = (creationFlags & CreateSuspended) ? 1 : 0;
+
         handle = g_nextThreadHandle;
         g_nextThreadHandle += 4;
 
@@ -373,26 +378,42 @@ PPC_FUNC(__imp__NtResumeThread)
     Kernel::CountImport("NtResumeThread");
     HANDLE host = nullptr;
     bool parking = false;
-    bool credited = false;
+    DWORD previous = 0;
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
         GuestThread* thread = FindThread(ctx.r3.u32);
         if (thread != nullptr)
         {
             host = thread->host;
-            parking = thread->parking;
-            if (parking)
+            bool resumed = false;
+            if (thread->externalSuspends > 0 && host != nullptr)
             {
-                thread->parking = false;
+                // External suspensions come first: one may have landed after
+                // the thread announced it was parking but before it parked,
+                // and it has to stop holding the thread before the park can.
+                // They are applied natively under this lock (NtSuspendThread),
+                // so the count is spent only when a native suspension really
+                // was undone.
+                previous = ResumeThread(host);
+                if (previous != 0 && previous != DWORD(-1))
+                {
+                    thread->externalSuspends--;
+                    resumed = true;
+                }
             }
-            else if (thread->osId != 0 && thread->osId != GetCurrentThreadId())
+            if (!resumed)
             {
-                // Not parking and, if it is not suspended either, the resume
-                // would be lost; the credit is spent by its next self suspend.
-                // A thread still suspended from its creation is resumed for
-                // real below and the credit taken back.
-                thread->resumeCredits++;
-                credited = true;
+                parking = thread->parking;
+                if (parking)
+                {
+                    thread->parking = false;
+                }
+                else if (thread->osId != 0 && thread->osId != GetCurrentThreadId())
+                {
+                    // Not parking and not externally suspended: the resume arrived
+                    // before the worker's next self suspend, so bank it as a credit.
+                    thread->resumeCredits++;
+                }
             }
         }
     }
@@ -404,23 +425,34 @@ PPC_FUNC(__imp__NtResumeThread)
         return;
     }
 
-    DWORD previous = ResumeThread(host);
     if (parking)
     {
         // The thread said it was about to suspend; if it has not yet, the
-        // resume did nothing and is tried again until it has.
-        while (previous == 0)
+        // resume did nothing and is tried again until it has. Each attempt
+        // is made under the lock and only while no external suspension is
+        // outstanding: the native count is then the park alone, so a resume
+        // that succeeds cannot have spent somebody else's suspension. (A
+        // thread held by an external suspension cannot reach its park until
+        // that is resumed, so the attempt waits for it.)
+        for (;;)
         {
+            {
+                std::lock_guard<std::mutex> lock(g_threadsMutex);
+                GuestThread* thread = FindThread(ctx.r3.u32);
+                if (thread == nullptr || thread->host == nullptr)
+                {
+                    previous = DWORD(-1);
+                    break;
+                }
+                if (thread->externalSuspends == 0)
+                {
+                    previous = ResumeThread(thread->host);
+                    if (previous != 0)
+                        break;
+                }
+            }
             std::this_thread::yield();
-            previous = ResumeThread(host);
         }
-    }
-    else if (credited && previous != DWORD(-1) && previous != 0)
-    {
-        // It was suspended after all, so the resume counted; no credit.
-        std::lock_guard<std::mutex> lock(g_threadsMutex);
-        GuestThread* thread = FindThread(ctx.r3.u32);
-        if (thread != nullptr && thread->resumeCredits > 0) thread->resumeCredits--;
     }
     if (ctx.r4.u32 != 0 && previous != DWORD(-1))
         Guest::Write32(base, ctx.r4.u32, previous);
@@ -441,6 +473,7 @@ PPC_FUNC(__imp__NtSuspendThread)
     HANDLE host = nullptr;
     bool self = false;
     bool spentCredit = false;
+    DWORD previous = 0;
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
         GuestThread* thread = FindThread(ctx.r3.u32);
@@ -459,9 +492,19 @@ PPC_FUNC(__imp__NtSuspendThread)
                 thread->parking = true;
             }
         }
+        else
+        {
+            // Suspending another thread does not block this one, and the
+            // target cannot be holding this lock while we do, so the native
+            // suspension is applied here: publishing the count and applying
+            // it together means a concurrent NtResumeThread cannot consume
+            // the count before the suspension it stands for has taken effect.
+            previous = SuspendThread(host);
+            if (previous != DWORD(-1))
+                thread->externalSuspends++;
+        }
     }
 
-    DWORD previous;
     static const bool noPark = getenv("COD3_NOPARK") != nullptr;
     if (self && (spentCredit || noPark))
     {
@@ -486,13 +529,6 @@ PPC_FUNC(__imp__NtSuspendThread)
         Scheduler::Release();
         previous = SuspendThread(GetCurrentThread());
         Scheduler::Acquire();
-        std::lock_guard<std::mutex> lock(g_threadsMutex);
-        GuestThread* thread = FindThread(ctx.r3.u32);
-        if (thread != nullptr) thread->parking = false;
-    }
-    else
-    {
-        previous = SuspendThread(host);
     }
     if (ctx.r4.u32 != 0 && previous != DWORD(-1))
         Guest::Write32(base, ctx.r4.u32, previous);
@@ -572,17 +608,45 @@ void Kernel::RegisterEntryThread()
     thread.osId = GetCurrentThreadId();
 
     std::lock_guard<std::mutex> lock(g_threadsMutex);
+    // Registering again (the self test and then the title, say) replaces the
+    // entry; the handle it held is closed rather than leaked.
+    auto previous = g_threads.find(0);
+    if (previous != g_threads.end() && previous->second.host != nullptr)
+        CloseHandle(previous->second.host);
     g_threads[0] = thread;
 }
 
 std::vector<Kernel::ThreadSample> Kernel::SampleGuestThreads()
 {
+    // Each sample gets its own duplicate of the thread handle, made under the
+    // lock: the table's handle is closed when the thread exits, and the
+    // sampler uses these long after the lock is gone. A duplicate keeps the
+    // thread's identity alive (on macOS, its Mach send right and so its port
+    // name) until ReleaseThreadSamples closes it, so a sample can never end up
+    // suspending an unrelated thread that inherited a recycled handle.
     std::lock_guard<std::mutex> lock(g_threadsMutex);
     std::vector<ThreadSample> out;
     out.reserve(g_threads.size());
     for (const auto& entry : g_threads)
-        out.push_back({ entry.second.host, entry.second.id, entry.second.osId, entry.second.startAddress });
+    {
+        HANDLE duplicate = nullptr;
+        if (entry.second.host != nullptr &&
+            !DuplicateHandle(GetCurrentProcess(), entry.second.host,
+                             GetCurrentProcess(), &duplicate,
+                             THREAD_ALL_ACCESS, FALSE, 0))
+            duplicate = nullptr;
+        out.push_back({ duplicate, entry.second.id, entry.second.osId, entry.second.startAddress });
+    }
     return out;
+}
+
+void Kernel::ReleaseThreadSamples(std::vector<ThreadSample>& samples)
+{
+    for (ThreadSample& sample : samples)
+    {
+        if (sample.handle != nullptr) CloseHandle(sample.handle);
+        sample.handle = nullptr;
+    }
 }
 
 void Kernel::SignalThreadExit(uint32_t osId)
@@ -595,7 +659,16 @@ void Kernel::SignalThreadExit(uint32_t osId)
     {
         std::lock_guard<std::mutex> lock(g_threadsMutex);
         for (auto& entry : g_threads)
-            if (entry.second.osId == osId) { object = entry.second.guestObject; break; }
+            if (entry.second.osId == osId)
+            {
+                object = entry.second.guestObject;
+                // Every use of the table's handle is made under this lock,
+                // and samplers hold duplicates of their own, so it can be
+                // closed here.
+                if (entry.second.host != nullptr) CloseHandle(entry.second.host);
+                entry.second.host = nullptr;
+                break;
+            }
     }
     if (object == 0) return;
 

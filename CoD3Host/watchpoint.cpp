@@ -21,8 +21,12 @@
 #include <set>
 #include <vector>
 
+#ifdef _WIN32
 #include <Windows.h>
 #include <TlHelp32.h>
+#else
+#include "platform.h"
+#endif
 
 namespace
 {
@@ -133,9 +137,12 @@ bool Kernel::SelfTestWatchpoint()
     if (done) return true;
     done = true;
 
-    const uint32_t scratch = 0x3F7FF000;   // inside the runtime's own region
+    // The second word of a doubleword, so the byte selection is checked as
+    // well as the trap: the word below it shares the aligned doubleword and
+    // must not fire.
+    const uint32_t scratch = 0x3F7FF004;   // inside the runtime's own region
     const uintptr_t host = reinterpret_cast<uintptr_t>(Guest::Base) + scratch;
-    VirtualAlloc(Guest::Ptr(scratch), 0x1000, MEM_COMMIT, PAGE_READWRITE);
+    VirtualAlloc(Guest::Ptr(scratch & ~0xFFFu), 0x1000, MEM_COMMIT, PAGE_READWRITE);
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -158,8 +165,20 @@ bool Kernel::SelfTestWatchpoint()
     if (!SetThreadContext(self, &context)) return false;
 
     const int before = g_reports.load();
-    *reinterpret_cast<volatile uint32_t*>(Guest::Ptr(scratch)) = 0x12345678;
-    const bool fired = g_reports.load() != before;
+    auto* watched = reinterpret_cast<volatile uint32_t*>(Guest::Ptr(scratch));
+    *watched = 0x12345678;
+    const int afterFirst = g_reports.load();
+    // A second write must be caught too: the watch is re-armed after a hit.
+    *watched = 0x23456789;
+    const int afterSecond = g_reports.load();
+    // Neither the neighbouring word nor a read (write-only watch) may fire.
+    watched[-1] = 0x3456789A;
+    const uint32_t readBack = *watched;
+    (void)readBack;
+    const int afterOthers = g_reports.load();
+    const bool fired = afterFirst == before + 1;
+    const bool rearmed = afterSecond == afterFirst + 1;
+    const bool selective = afterOthers == afterSecond;
 
     // Put it back the way it was.
     {
@@ -171,14 +190,25 @@ bool Kernel::SelfTestWatchpoint()
     context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     SetThreadContext(self, &context);
 
-    printf("watchpoint: self test %s\n", fired ? "fired, the mechanism works"
-                                               : "DID NOT FIRE, the mechanism is not working");
+    printf("watchpoint: self test %s\n",
+        !fired      ? "DID NOT FIRE, the mechanism is not working"
+        : !rearmed  ? "fired once but MISSED THE SECOND WRITE, the watch is not re-armed"
+        : !selective ? "FIRED ON A NEIGHBOURING WORD OR A READ, the byte or access selection is wrong"
+                     : "fired on both writes and nothing else, the mechanism works");
     fflush(stdout);
-    return fired;
+    return fired && rearmed && selective;
 }
 
 bool Kernel::ReportWatchpoint(void* winContext)
 {
+#ifndef _WIN32
+    // The one-shot breakpoint after a watched access (see below): the access
+    // has completed, so the watch goes back on and execution carries on.
+    // Checked before g_watched, which the self test clears while a step may
+    // still be pending.
+    if (WatchpointStepEnd(static_cast<const CONTEXT*>(winContext)->Rip))
+        return true;
+#endif
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_watched == 0) return false;
@@ -186,6 +216,15 @@ bool Kernel::ReportWatchpoint(void* winContext)
     // Every hit is counted, because the self test below is a host side
     // write that expects to be counted. Only the printing is filtered.
     const int report = g_reports.fetch_add(1);
+
+#ifndef _WIN32
+    // On ARM64 the watchpoint trap is taken before the access completes, so
+    // returning with the watch armed would trap on the same instruction
+    // forever. Step past it with the watch off and re-arm it on the next
+    // instruction, so later accesses are caught too, as they are on x86
+    // where the trap comes after the access.
+    WatchpointStepBegin(static_cast<const CONTEXT*>(winContext)->Rip);
+#endif
 
     uint32_t functions[12] = {};
     const int count = Sampler::WalkGuestStack(winContext, functions, 12);
@@ -224,7 +263,7 @@ bool Kernel::ReportWatchpoint(void* winContext)
         const CONTEXT* context = static_cast<const CONTEXT*>(winContext);
         const uint32_t function = Sampler::FunctionAt(context->Rip);
         const PPCContext* guest = Kernel::ContextOf(GetCurrentThreadId());
-        printf("  written by sub_%08X, os thread %lu, lr 0x%08X\n", function, GetCurrentThreadId(),
+        printf("  written by sub_%08X, os thread %lu, lr 0x%08X\n", function, (unsigned long)GetCurrentThreadId(),
             guest ? uint32_t(guest->lr) : 0);
     }
     fflush(stdout);

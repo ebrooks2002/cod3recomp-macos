@@ -63,19 +63,21 @@ add_executable(CoD3 WIN32
     "d3d_hooks.cpp"
     "native_state.cpp"
     "write_watch.cpp"
-    "modules.cpp")
+    "modules.cpp"
+    "kernel_thread.cpp"
+    "sampler.cpp"
+    "watchpoint.cpp"
+    "watchdog.cpp"
+    "coroutines.cpp")
 
 if (WIN32)
     target_sources(CoD3 PRIVATE
-        "kernel_thread.cpp"
         "render_d3d11.cpp"
         "render_commands.cpp"
         "render_pipeline.cpp"
         "render_shaders.cpp"
         "render_resources.cpp"
         "render_stats.cpp"
-        "sampler.cpp"
-        "watchpoint.cpp"
         "window.cpp"
         "input.cpp"
         "overlay.cpp"
@@ -83,8 +85,6 @@ if (WIN32)
         "../thirdparty/imgui/backends/imgui_impl_win32.cpp"
         "audio_out.cpp"
         "xma.cpp"
-        "watchdog.cpp"
-        "coroutines.cpp"
         "resources/CoD3.rc")
 elseif (APPLE)
     target_sources(CoD3 PRIVATE "platform_macos.mm")
