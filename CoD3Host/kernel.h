@@ -86,7 +86,10 @@ namespace Kernel
         uint32_t osId = 0;   // so a stack can be matched to a lock owner
         uint32_t startAddress = 0;
     };
+    // Each handle is a duplicate the caller owns, valid even after the thread
+    // exits; pass the vector to ReleaseThreadSamples when finished with it.
     std::vector<ThreadSample> SampleGuestThreads();
+    void ReleaseThreadSamples(std::vector<ThreadSample>& samples);
 
     // The thread that entered the guest is not one ExCreateThread made, so it
     // has to be registered by hand or the sampler cannot see the one thread

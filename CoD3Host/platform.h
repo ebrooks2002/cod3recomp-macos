@@ -810,6 +810,18 @@ BOOL   SetThreadPriority(HANDLE hThread, int nPriority);
 HANDLE OpenThread(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwThreadId);
 BOOL   GetThreadContext(HANDLE hThread, CONTEXT* lpContext);
 BOOL   SetThreadContext(HANDLE hThread, const CONTEXT* lpContext);
+
+// Stepping the current thread past a hardware watchpoint hit (ARM64).
+// The watchpoint trap is taken before the access completes, and Darwin resets
+// PSTATE.SS on sigreturn, so MDSCR single-step cannot be used from the
+// handler. Instead the watch is disabled and a one-shot hardware breakpoint is
+// set on the next instruction (a load or store never branches); when that
+// breakpoint traps, the watch is restored. Both are async-signal-safe.
+//   WatchpointStepBegin: called on the watch trap, with the trapping PC.
+//   WatchpointStepEnd:   called on any SIGTRAP; returns true, and re-arms the
+//                        watch, only if the trap is this thread's pending step.
+bool   WatchpointStepBegin(uint64_t trappingPc);
+bool   WatchpointStepEnd(uint64_t pc);
 BOOL   GetThreadTimes(HANDLE hThread, FILETIME* lpCreationTime, FILETIME* lpExitTime,
                       FILETIME* lpKernelTime, FILETIME* lpUserTime);
 HANDLE CreateToolhelp32Snapshot(DWORD dwFlags, DWORD th32ProcessID);

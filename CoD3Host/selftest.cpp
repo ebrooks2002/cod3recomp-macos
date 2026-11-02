@@ -574,6 +574,15 @@ namespace
         SELFTEST_CHECK(workerHandle != 0, "ExCreateThread returned null handle");
         g_workerHandle.store(workerHandle, std::memory_order_release);
 
+        // A sampler's view of the threads, taken while the worker is alive and
+        // kept until after it exits: its handle must stay bound to the worker.
+        std::vector<Kernel::ThreadSample> earlySamples = Kernel::SampleGuestThreads();
+        HANDLE earlyWorker = nullptr;
+        const uint32_t workerId = Guest::Read32(Guest::Base, ScratchTidOut);   // the guest thread id
+        for (const auto& sample : earlySamples)
+            if (sample.handle != nullptr && sample.id == workerId) earlyWorker = sample.handle;
+        SELFTEST_CHECK(earlyWorker != nullptr, "SampleGuestThreads gave no handle for the live worker");
+
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         SELFTEST_CHECK(!g_workerStarted.load(std::memory_order_acquire),
             "Thread created with CREATE_SUSPENDED ran before NtResumeThread");
@@ -624,6 +633,30 @@ namespace
             "Worker thread did not finish after %d suspend/resume cycles", ParkingCycles);
         *workerSlot = savedWorkerSlot;
 
+        // The worker has exited: the table no longer hands out a handle for
+        // it, and the sample taken earlier still names the dead worker (so
+        // suspending through it fails) rather than whatever thread might have
+        // been given a recycled port name.
+        {
+            std::vector<Kernel::ThreadSample> lateSamples = Kernel::SampleGuestThreads();
+            bool lateHandle = false;
+            for (const auto& sample : lateSamples)
+                if (sample.id == workerId && sample.handle != nullptr) lateHandle = true;
+            Kernel::ReleaseThreadSamples(lateSamples);
+            SELFTEST_CHECK(!lateHandle, "SampleGuestThreads still handed out a handle for the exited worker");
+
+            bool stale = false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline)
+            {
+                if (SuspendThread(earlyWorker) == DWORD(-1)) { stale = true; break; }
+                ResumeThread(earlyWorker);   // still unwinding its exit; let it finish
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            Kernel::ReleaseThreadSamples(earlySamples);
+            SELFTEST_CHECK(stale, "A sampled handle to the exited worker still suspends a live thread");
+        }
+
         // Verify case-insensitive multi-component guest path resolution.
         {
             const std::filesystem::path tempRoot =
@@ -647,7 +680,7 @@ namespace
             SELFTEST_CHECK(sameFile,
                 "Case-insensitive ResolveGuestPath failed (resolved='%s')", resolved.string().c_str());
         }
-        printf("  [PASS] 2. Mach thread_suspend/thread_resume passed %d parking cycles + case-insensitive ResolveGuestPath verified\n",
+        printf("  [PASS] 2. Mach thread_suspend/thread_resume passed %d parking cycles, sampled thread handle outlived its thread safely + case-insensitive ResolveGuestPath verified\n",
             ParkingCycles);
 
         // --------------------------------------------------------------------
@@ -717,6 +750,15 @@ namespace
 
         printf("  [PASS] 3. Sampler::FunctionsOnStack & Sampler::WalkGuestStack unwound 3-deep guest chain: sub_%08X <- sub_%08X <- sub_%08X\n",
             g_walkedFuncs[0], g_walkedFuncs[1], g_walkedFuncs[2]);
+
+        // --------------------------------------------------------------------
+        // 4. Hardware watchpoint: fires on a write to the watched word, is
+        //    re-armed so a second write fires too, and selects only the
+        //    watched bytes and access (not the neighbouring word, not reads).
+        // --------------------------------------------------------------------
+        SELFTEST_CHECK(Kernel::SelfTestWatchpoint(),
+            "Kernel::SelfTestWatchpoint failed (see the watchpoint line above)");
+        printf("  [PASS] 4. Hardware watchpoint fired on both writes, re-armed after each hit, ignored neighbour word and reads\n");
 
         Kernel::SetCurrentContext(nullptr);
         Guest::ReleaseThreadPointer(mainTp);

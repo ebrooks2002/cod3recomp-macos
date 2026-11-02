@@ -385,24 +385,35 @@ PPC_FUNC(__imp__NtResumeThread)
         if (thread != nullptr)
         {
             host = thread->host;
-            parking = thread->parking;
-            if (parking)
+            bool resumed = false;
+            if (thread->externalSuspends > 0 && host != nullptr)
             {
-                thread->parking = false;
-            }
-            else if (thread->externalSuspends > 0 && host != nullptr)
-            {
-                // External suspensions are applied natively under this lock
-                // (see NtSuspendThread), so the count and the native suspend
-                // count agree here and the resume is never spent early.
-                thread->externalSuspends--;
+                // External suspensions come first: one may have landed after
+                // the thread announced it was parking but before it parked,
+                // and it has to stop holding the thread before the park can.
+                // They are applied natively under this lock (NtSuspendThread),
+                // so the count is spent only when a native suspension really
+                // was undone.
                 previous = ResumeThread(host);
+                if (previous != 0 && previous != DWORD(-1))
+                {
+                    thread->externalSuspends--;
+                    resumed = true;
+                }
             }
-            else if (thread->osId != 0 && thread->osId != GetCurrentThreadId())
+            if (!resumed)
             {
-                // Not parking and not externally suspended: the resume arrived
-                // before the worker's next self suspend, so bank it as a credit.
-                thread->resumeCredits++;
+                parking = thread->parking;
+                if (parking)
+                {
+                    thread->parking = false;
+                }
+                else if (thread->osId != 0 && thread->osId != GetCurrentThreadId())
+                {
+                    // Not parking and not externally suspended: the resume arrived
+                    // before the worker's next self suspend, so bank it as a credit.
+                    thread->resumeCredits++;
+                }
             }
         }
     }
@@ -417,12 +428,30 @@ PPC_FUNC(__imp__NtResumeThread)
     if (parking)
     {
         // The thread said it was about to suspend; if it has not yet, the
-        // resume did nothing and is tried again until it has.
-        previous = ResumeThread(host);
-        while (previous == 0)
+        // resume did nothing and is tried again until it has. Each attempt
+        // is made under the lock and only while no external suspension is
+        // outstanding: the native count is then the park alone, so a resume
+        // that succeeds cannot have spent somebody else's suspension. (A
+        // thread held by an external suspension cannot reach its park until
+        // that is resumed, so the attempt waits for it.)
+        for (;;)
         {
+            {
+                std::lock_guard<std::mutex> lock(g_threadsMutex);
+                GuestThread* thread = FindThread(ctx.r3.u32);
+                if (thread == nullptr || thread->host == nullptr)
+                {
+                    previous = DWORD(-1);
+                    break;
+                }
+                if (thread->externalSuspends == 0)
+                {
+                    previous = ResumeThread(thread->host);
+                    if (previous != 0)
+                        break;
+                }
+            }
             std::this_thread::yield();
-            previous = ResumeThread(host);
         }
     }
     if (ctx.r4.u32 != 0 && previous != DWORD(-1))
@@ -579,17 +608,45 @@ void Kernel::RegisterEntryThread()
     thread.osId = GetCurrentThreadId();
 
     std::lock_guard<std::mutex> lock(g_threadsMutex);
+    // Registering again (the self test and then the title, say) replaces the
+    // entry; the handle it held is closed rather than leaked.
+    auto previous = g_threads.find(0);
+    if (previous != g_threads.end() && previous->second.host != nullptr)
+        CloseHandle(previous->second.host);
     g_threads[0] = thread;
 }
 
 std::vector<Kernel::ThreadSample> Kernel::SampleGuestThreads()
 {
+    // Each sample gets its own duplicate of the thread handle, made under the
+    // lock: the table's handle is closed when the thread exits, and the
+    // sampler uses these long after the lock is gone. A duplicate keeps the
+    // thread's identity alive (on macOS, its Mach send right and so its port
+    // name) until ReleaseThreadSamples closes it, so a sample can never end up
+    // suspending an unrelated thread that inherited a recycled handle.
     std::lock_guard<std::mutex> lock(g_threadsMutex);
     std::vector<ThreadSample> out;
     out.reserve(g_threads.size());
     for (const auto& entry : g_threads)
-        out.push_back({ entry.second.host, entry.second.id, entry.second.osId, entry.second.startAddress });
+    {
+        HANDLE duplicate = nullptr;
+        if (entry.second.host != nullptr &&
+            !DuplicateHandle(GetCurrentProcess(), entry.second.host,
+                             GetCurrentProcess(), &duplicate,
+                             THREAD_ALL_ACCESS, FALSE, 0))
+            duplicate = nullptr;
+        out.push_back({ duplicate, entry.second.id, entry.second.osId, entry.second.startAddress });
+    }
     return out;
+}
+
+void Kernel::ReleaseThreadSamples(std::vector<ThreadSample>& samples)
+{
+    for (ThreadSample& sample : samples)
+    {
+        if (sample.handle != nullptr) CloseHandle(sample.handle);
+        sample.handle = nullptr;
+    }
 }
 
 void Kernel::SignalThreadExit(uint32_t osId)
@@ -605,6 +662,10 @@ void Kernel::SignalThreadExit(uint32_t osId)
             if (entry.second.osId == osId)
             {
                 object = entry.second.guestObject;
+                // Every use of the table's handle is made under this lock,
+                // and samplers hold duplicates of their own, so it can be
+                // closed here.
+                if (entry.second.host != nullptr) CloseHandle(entry.second.host);
                 entry.second.host = nullptr;
                 break;
             }

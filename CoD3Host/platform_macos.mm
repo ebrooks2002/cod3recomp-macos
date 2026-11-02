@@ -839,7 +839,11 @@ namespace
         std::shared_ptr<PthreadStartInfo> info = std::move(*holder);
         delete holder;
 
-        const mach_port_t selfPort = pthread_mach_thread_np(pthread_self());
+        // An owned send right, taken by the child before the parent can see
+        // it and so before the child can possibly exit: libpthread's own
+        // reference goes away with a detached thread, after which the name
+        // could be reused for an unrelated thread. CloseHandle releases it.
+        const mach_port_t selfPort = mach_thread_self();
         const DWORD osId = GetCurrentThreadId();
         const bool createSuspended = info->createSuspended;
         const LPTHREAD_START_ROUTINE startAddress = info->startAddress;
@@ -881,12 +885,16 @@ BOOL DuplicateHandle(HANDLE, HANDLE hSourceHandle, HANDLE, HANDLE* lpTargetHandl
 {
     if (!lpTargetHandle) return FALSE;
     const mach_port_t port = HandleToMachPort(hSourceHandle);
-    if (port == MACH_PORT_NULL)
+    // A duplicate holds its own send-right reference, so it stays valid (and
+    // its port name cannot be reused for another thread) until it is closed,
+    // whatever happens to the source handle or the thread.
+    if (port == MACH_PORT_NULL ||
+        mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, 1) != KERN_SUCCESS)
     {
         *lpTargetHandle = nullptr;
         return FALSE;
     }
-    *lpTargetHandle = BorrowedThreadToHandle(port);
+    *lpTargetHandle = OwnedThreadToHandle(port);
     return TRUE;
 }
 
@@ -936,7 +944,7 @@ HANDLE CreateThread(void*, size_t dwStackSize, LPTHREAD_START_ROUTINE lpStartAdd
     if (lpThreadId)
         *lpThreadId = info->osId;
 
-    return BorrowedThreadToHandle(info->machPort);
+    return OwnedThreadToHandle(info->machPort);
 }
 
 DWORD SuspendThread(HANDLE hThread)
@@ -1031,6 +1039,121 @@ HANDLE OpenThread(DWORD, BOOL, DWORD dwThreadId)
     return OwnedThreadToHandle(foundPort);
 }
 
+#if defined(__aarch64__)
+namespace
+{
+    // CONTEXT carries the watch x86 style: Dr0 the byte address, Dr7 bit 0
+    // the enable, bits 16-17 the access (01 write, 11 read/write), bits
+    // 18-19 the length (00 one byte, 01 two, 11 four, 10 eight). ARM64 wants
+    // a doubleword-aligned DBGWVR plus a DBGWCR whose LSC field selects
+    // loads/stores and whose BAS field selects bytes within that doubleword.
+    constexpr uint64_t WcrEnable   = 1u << 0;
+    constexpr uint64_t WcrPacEl0   = 2u << 1;   // trap at EL0 only
+    constexpr uint64_t WcrLscStore = 2u << 3;
+    constexpr uint64_t WcrLscBoth  = 3u << 3;
+    constexpr uint64_t BcrEnable   = 1u << 0;
+    constexpr uint64_t BcrPacEl0   = 2u << 1;
+    constexpr uint64_t BcrBasA64   = 0xFu << 5; // a whole A64 instruction
+
+    bool Dr7ToWatch(uint64_t dr0, uint64_t dr7, uint64_t& wvr, uint64_t& wcr)
+    {
+        if ((dr7 & 1u) == 0)
+        {
+            wvr = dr0;
+            wcr = 0;
+            return true;
+        }
+        const uint64_t rw = (dr7 >> 16) & 3u;
+        if (rw != 1u && rw != 3u)
+            return false;   // execute and I/O breakpoints have no watch equivalent
+        static constexpr unsigned LengthOf[4] = { 1, 2, 8, 4 };
+        const unsigned length = LengthOf[(dr7 >> 18) & 3u];
+        const unsigned offset = static_cast<unsigned>(dr0 & 7u);
+        if (offset + length > 8)
+            return false;   // straddles a doubleword: needs two watchpoints
+        const uint64_t bas = ((1u << length) - 1u) << offset;
+        wvr = dr0 & ~uint64_t(7);
+        wcr = WcrEnable | WcrPacEl0 | (rw == 3u ? WcrLscBoth : WcrLscStore) | (bas << 5);
+        return true;
+    }
+
+    void WatchToDr7(uint64_t wvr, uint64_t wcr, uint64_t& dr0, uint64_t& dr7)
+    {
+        const unsigned bas = static_cast<unsigned>((wcr >> 5) & 0xFFu);
+        if ((wcr & WcrEnable) == 0 || bas == 0)
+        {
+            dr0 = wvr;
+            dr7 = 0;
+            return;
+        }
+        const unsigned offset = static_cast<unsigned>(__builtin_ctz(bas));
+        const unsigned length = static_cast<unsigned>(__builtin_popcount(bas));
+        const uint64_t lengthCode = length == 1 ? 0u : length == 2 ? 1u : length == 8 ? 2u : 3u;
+        const uint64_t rw = ((wcr >> 3) & 3u) == 3u ? 3u : 1u;
+        dr0 = wvr + offset;
+        dr7 = 1u | (rw << 16) | (lengthCode << 18);
+    }
+
+    // The current thread's pending step over a watchpoint hit.
+    thread_local bool     t_watchStepping = false;
+    thread_local uint64_t t_watchStepPc = 0;
+    thread_local uint64_t t_watchSavedWcr = 0;
+}
+#endif
+
+bool WatchpointStepBegin(uint64_t trappingPc)
+{
+#if defined(__aarch64__)
+    const mach_port_t self = pthread_mach_thread_np(pthread_self());
+    arm_debug_state64_t dbg{};
+    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+    if (thread_get_state(self, ARM_DEBUG_STATE64,
+                         reinterpret_cast<thread_state_t>(&dbg), &count) != KERN_SUCCESS)
+        return false;
+    t_watchSavedWcr = dbg.__wcr[0];
+    t_watchStepPc = trappingPc + 4;
+    t_watchStepping = true;
+    dbg.__wcr[0] = 0;
+    dbg.__bvr[0] = t_watchStepPc;
+    dbg.__bcr[0] = BcrEnable | BcrPacEl0 | BcrBasA64;
+    if (thread_set_state(self, ARM_DEBUG_STATE64, reinterpret_cast<thread_state_t>(&dbg),
+                         ARM_DEBUG_STATE64_COUNT) != KERN_SUCCESS)
+    {
+        t_watchStepping = false;
+        return false;
+    }
+    return true;
+#else
+    (void)trappingPc;
+    return false;
+#endif
+}
+
+bool WatchpointStepEnd(uint64_t pc)
+{
+#if defined(__aarch64__)
+    if (!t_watchStepping || pc != t_watchStepPc)
+        return false;
+    t_watchStepping = false;
+    const mach_port_t self = pthread_mach_thread_np(pthread_self());
+    arm_debug_state64_t dbg{};
+    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+    if (thread_get_state(self, ARM_DEBUG_STATE64,
+                         reinterpret_cast<thread_state_t>(&dbg), &count) == KERN_SUCCESS)
+    {
+        dbg.__bcr[0] = 0;
+        dbg.__bvr[0] = 0;
+        dbg.__wcr[0] = t_watchSavedWcr;
+        thread_set_state(self, ARM_DEBUG_STATE64, reinterpret_cast<thread_state_t>(&dbg),
+                         ARM_DEBUG_STATE64_COUNT);
+    }
+    return true;
+#else
+    (void)pc;
+    return false;
+#endif
+}
+
 BOOL GetThreadContext(HANDLE hThread, CONTEXT* lpContext)
 {
     if (!lpContext) return FALSE;
@@ -1065,8 +1188,7 @@ BOOL GetThreadContext(HANDLE hThread, CONTEXT* lpContext)
         if (thread_get_state(port, ARM_DEBUG_STATE64,
                              reinterpret_cast<thread_state_t>(&dbg), &count) == KERN_SUCCESS)
         {
-            lpContext->Dr0 = dbg.__wvr[0];
-            lpContext->Dr7 = dbg.__wcr[0];
+            WatchToDr7(dbg.__wvr[0], dbg.__wcr[0], lpContext->Dr0, lpContext->Dr7);
         }
     }
     return TRUE;
@@ -1089,15 +1211,15 @@ BOOL SetThreadContext(HANDLE hThread, const CONTEXT* lpContext)
         return FALSE;
     if (requested & ContextDebugMask)
     {
+        uint64_t wvr = 0, wcr = 0;
+        if (!Dr7ToWatch(lpContext->Dr0, lpContext->Dr7, wvr, wcr))
+            return FALSE;
         arm_debug_state64_t dbg{};
         mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
         thread_get_state(port, ARM_DEBUG_STATE64,
                          reinterpret_cast<thread_state_t>(&dbg), &count);
-        dbg.__wvr[0] = lpContext->Dr0;
-        if (lpContext->Dr7 != 0)
-            dbg.__wcr[0] = (1u << 0) | (2u << 1) | (2u << 3) | (0xFu << 5);
-        else
-            dbg.__wcr[0] = 0;
+        dbg.__wvr[0] = wvr;
+        dbg.__wcr[0] = wcr;
         return thread_set_state(port, ARM_DEBUG_STATE64,
                                 reinterpret_cast<thread_state_t>(&dbg),
                                 ARM_DEBUG_STATE64_COUNT) == KERN_SUCCESS ? TRUE : FALSE;

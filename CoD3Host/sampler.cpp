@@ -225,6 +225,12 @@ namespace
     {
         std::vector<Kernel::ThreadSample> threads = Kernel::SampleGuestThreads();
         if (threads.empty()) return;
+        // The handles are this function's own duplicates; closed on every way out.
+        struct Release
+        {
+            std::vector<Kernel::ThreadSample>& samples;
+            ~Release() { Kernel::ReleaseThreadSamples(samples); }
+        } release{ threads };
 
         // Three samples a fifth of a second apart. A thread doing work shows a
         // different stack each time; a stuck one shows the same stack, and that
@@ -352,7 +358,12 @@ void Sampler::ReportThreadTimes(const std::vector<std::pair<uint32_t, const char
     previousWall = now;
 
     std::map<uint32_t, Kernel::ThreadSample> guest;
-    for (const Kernel::ThreadSample& thread : Kernel::SampleGuestThreads()) guest[thread.osId] = thread;
+    {
+        // Only the identities are wanted here, not the handles: release them now.
+        std::vector<Kernel::ThreadSample> samples = Kernel::SampleGuestThreads();
+        Kernel::ReleaseThreadSamples(samples);
+        for (const Kernel::ThreadSample& thread : samples) guest[thread.osId] = thread;
+    }
 
     struct Row { double percent; DWORD os; };
     std::vector<Row> rows;
