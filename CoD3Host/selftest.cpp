@@ -1,12 +1,24 @@
 #include "selftest.h"
 #include "coroutines.h"
+#include "gpu.h"
 #include "kernel.h"
+#include "render.h"
+#include "render_pipeline.h"
+#include "render_resources.h"
+#include "render_shaders.h"
+#include "render_state.h"
 #include "sampler.h"
 #include "write_watch.h"
+#include "xenos_hlsl.h"
 #include "platform.h"
+
+#include <d3d11_1.h>
+#include <d3dcompiler.h>
+#include <wrl/client.h>
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -767,6 +779,389 @@ namespace
         fflush(stdout);
         return 0;
     }
+
+    int RunRenderSelfTest()
+    {
+        printf("=== Gate 5 Self-Test: Xenos->HLSL Translation, D3D11 Backend, Render Caches & Resolve ===\n");
+        fflush(stdout);
+
+        using Microsoft::WRL::ComPtr;
+
+        // Isolate shader disk cache and captured shader microcode in a temporary directory for this self-test.
+        const std::filesystem::path tempCacheRoot =
+            std::filesystem::temp_directory_path() / "cod3_gate5_shader_cache";
+        std::error_code ec;
+        const std::filesystem::path origCwd = std::filesystem::current_path(ec);
+        std::filesystem::remove_all(tempCacheRoot, ec);
+        std::filesystem::create_directories(tempCacheRoot, ec);
+        std::filesystem::current_path(tempCacheRoot, ec);
+        struct ScopedTempDirCleanup
+        {
+            std::filesystem::path origCwd;
+            std::filesystem::path tempRoot;
+            ~ScopedTempDirCleanup()
+            {
+                std::error_code cleanupEc;
+                if (!origCwd.empty())
+                    std::filesystem::current_path(origCwd, cleanupEc);
+                std::filesystem::remove_all(tempRoot, cleanupEc);
+            }
+        } tempDirGuard{ origCwd, tempCacheRoot };
+#ifndef _WIN32
+        setenv("LOCALAPPDATA", tempCacheRoot.string().c_str(), 1);
+        setenv("COD3_NOPRECOMPILE", "1", 1);
+        setenv("COD3_SCALE", "1", 1);
+#else
+        _putenv_s("LOCALAPPDATA", tempCacheRoot.string().c_str());
+        _putenv_s("COD3_NOPRECOMPILE", "1");
+        _putenv_s("COD3_SCALE", "1");
+#endif
+
+        // --------------------------------------------------------------------
+        // 1. Construct real Xenos vertex and pixel microcode programs,
+        //    translate via XenosHlsl::Translate, and compile via D3DCompile.
+        // --------------------------------------------------------------------
+        // Vertex microcode (4 slots = 12 dwords):
+        //   Slot 0 (CF): exece address=1, count=3, sequence=0b000001 (slot 1 is vfetch, slots 2-3 are ALU)
+        //   Slot 1 (vfetch): r[1].xyzw = vb0.Load4(r[0].x * 4), FMT_32_32_32_32_FLOAT (38), stride=4 dwords
+        //   Slot 2 (ALU):    oPos.xyzw = r[1].xyzw + c[0].xyzw
+        //   Slot 3 (ALU):    o0.xyzw   = c[1].xyzw + c[0].xyzw
+        const uint64_t vsCf0 = (uint64_t(2) << 44) | (uint64_t(1) << 16) | (uint64_t(3) << 12) | 1ull;
+        const std::vector<uint32_t> vsWords = {
+            uint32_t(vsCf0 & 0xFFFFFFFFull),
+            uint32_t((vsCf0 >> 32) & 0xFFFFull),
+            0u,
+            // Slot 1: Vertex fetch from slot 0 into r[1].xyzw, format 38 (float4), stride 4
+            (1u << 12),
+            0x688u | (38u << 16),
+            4u,
+            // Slot 2: ALU add -> oPos (dest=62, exported=1, mask=0xF), r[1] + c[0]
+            62u | (1u << 15) | (0xFu << 16),
+            0u,
+            (1u << 16) | (0u << 8) | (1u << 31),
+            // Slot 3: ALU add -> o0 (dest=0, exported=1, mask=0xF), c[1] + c[0]
+            0u | (1u << 15) | (0xFu << 16),
+            0u,
+            (1u << 16) | (0u << 8)
+        };
+
+        // Pixel microcode (2 slots = 6 dwords):
+        //   Slot 0 (CF): exece address=1, count=1, sequence=0 (slot 1 is ALU)
+        //   Slot 1 (ALU): oC0.xyzw = r[0].xyzw + c[0].xyzw
+        const uint64_t psCf0 = (uint64_t(2) << 44) | (uint64_t(0) << 16) | (uint64_t(1) << 12) | 1ull;
+        const std::vector<uint32_t> psWords = {
+            uint32_t(psCf0 & 0xFFFFFFFFull),
+            uint32_t((psCf0 >> 32) & 0xFFFFull),
+            0u,
+            // Slot 1: ALU add -> oC0 (dest=0, exported=1, mask=0xF), r[0] + c[0]
+            0u | (1u << 15) | (0xFu << 16),
+            0u,
+            (0u << 16) | (0u << 8) | (1u << 31)
+        };
+
+        const XenosHlsl::Translation vsTrans = XenosHlsl::Translate(vsWords, false);
+        SELFTEST_CHECK(vsTrans.ok, "Vertex microcode translation failed: %s", vsTrans.problem.c_str());
+        SELFTEST_CHECK(vsTrans.vertexFetches.size() == 1 && vsTrans.vertexFetches[0].slot == 0 && vsTrans.vertexFetches[0].stride == 4,
+            "Unexpected vertexFetches metadata (size=%zu)", vsTrans.vertexFetches.size());
+        SELFTEST_CHECK(vsTrans.constantMap.size() == 2 && vsTrans.constantMap[0] == 0 && vsTrans.constantMap[1] == 1,
+            "Unexpected vertex constantMap size=%zu", vsTrans.constantMap.size());
+
+        const XenosHlsl::Translation psTrans = XenosHlsl::Translate(psWords, true);
+        SELFTEST_CHECK(psTrans.ok, "Pixel microcode translation failed: %s", psTrans.problem.c_str());
+        SELFTEST_CHECK(psTrans.colourTargets == 1 && !psTrans.writesDepth,
+            "Unexpected pixel translation targets (colourTargets=%u writesDepth=%d)",
+            psTrans.colourTargets, psTrans.writesDepth ? 1 : 0);
+        SELFTEST_CHECK(psTrans.constantMap.size() == 1 && psTrans.constantMap[0] == 0,
+            "Unexpected pixel constantMap size=%zu", psTrans.constantMap.size());
+
+        ComPtr<ID3DBlob> vsBlob, vsErr, psBlob, psErr;
+        HRESULT hr = D3DCompile(vsTrans.hlsl.data(), vsTrans.hlsl.size(), "selftest_vs",
+            nullptr, nullptr, "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &vsErr);
+        SELFTEST_CHECK(SUCCEEDED(hr) && vsBlob && vsBlob->GetBufferSize() > 0,
+            "D3DCompile(vs_5_0) failed (hr=0x%08X): %s", unsigned(hr),
+            vsErr ? static_cast<const char*>(vsErr->GetBufferPointer()) : "no error blob");
+
+        hr = D3DCompile(psTrans.hlsl.data(), psTrans.hlsl.size(), "selftest_ps",
+            nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &psErr);
+        SELFTEST_CHECK(SUCCEEDED(hr) && psBlob && psBlob->GetBufferSize() > 0,
+            "D3DCompile(ps_5_0) failed (hr=0x%08X): %s", unsigned(hr),
+            psErr ? static_cast<const char*>(psErr->GetBufferPointer()) : "no error blob");
+
+        printf("  [PASS] 1. XenosHlsl::Translate & D3DCompile succeeded (VS=%zu bytes bytecode, PS=%zu bytes bytecode)\n",
+            vsBlob->GetBufferSize(), psBlob->GetBufferSize());
+
+        // --------------------------------------------------------------------
+        // 2. Initialize Guest VM + Render backend, load shaders through
+        //    Render::ShaderLoaded, wait for worker compilation, and verify
+        //    the on-disk shader cache round-trip.
+        // --------------------------------------------------------------------
+        SELFTEST_CHECK(Guest::Initialize(nullptr), "Guest::Initialize(nullptr) failed");
+        SELFTEST_CHECK(Guest::Base != nullptr, "Guest::Base is null");
+        SELFTEST_CHECK(Render::Enabled(), "Render::Enabled() failed to initialize D3D11 device");
+
+        constexpr uint32_t VsGuestAddr = 0xA0110000u;
+        constexpr uint32_t PsGuestAddr = 0xA0111000u;
+        for (size_t i = 0; i < vsWords.size(); ++i)
+            Guest::Write32(Guest::Base, VsGuestAddr + uint32_t(i * 4), vsWords[i]);
+        for (size_t i = 0; i < psWords.size(); ++i)
+            Guest::Write32(Guest::Base, PsGuestAddr + uint32_t(i * 4), psWords[i]);
+
+        Render::ShaderLoaded(false, VsGuestAddr, uint32_t(vsWords.size()));
+        Render::ShaderLoaded(true,  PsGuestAddr, uint32_t(psWords.size()));
+
+        const RenderState::Handle vsHandle = RenderShaders::Current(false);
+        const RenderState::Handle psHandle = RenderShaders::Current(true);
+        SELFTEST_CHECK(vsHandle != 0 && psHandle != 0,
+            "RenderShaders::Current returned invalid handle (vs=%u ps=%u)", vsHandle, psHandle);
+
+        const RenderShaders::Program* vsProg = RenderShaders::Get(vsHandle);
+        const RenderShaders::Program* psProg = RenderShaders::Get(psHandle);
+        SELFTEST_CHECK(vsProg != nullptr && psProg != nullptr, "RenderShaders::Get returned null");
+
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (std::chrono::steady_clock::now() < deadline)
+            {
+                const auto vsState = vsProg->state.load(std::memory_order_acquire);
+                const auto psState = psProg->state.load(std::memory_order_acquire);
+                if ((vsState == RenderShaders::State::Ready || vsState == RenderShaders::State::Failed) &&
+                    (psState == RenderShaders::State::Ready || psState == RenderShaders::State::Failed))
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        SELFTEST_CHECK(vsProg->state.load(std::memory_order_acquire) == RenderShaders::State::Ready,
+            "Vertex shader failed to reach Ready state (problem='%s')", vsProg->problem.c_str());
+        SELFTEST_CHECK(psProg->state.load(std::memory_order_acquire) == RenderShaders::State::Ready,
+            "Pixel shader failed to reach Ready state (problem='%s')", psProg->problem.c_str());
+        SELFTEST_CHECK(vsProg->shader != nullptr && psProg->shader != nullptr,
+            "Compiled shader device objects are null");
+
+        // Verify disk cache files were written with 'C3SH' header and matching bytecode size.
+        const std::filesystem::path shaderCacheDir = tempCacheRoot / "CoD3Recomp" / "shaders";
+        uint32_t cachedFilesFound = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(shaderCacheDir, ec))
+        {
+            if (!entry.is_regular_file()) continue;
+            std::ifstream in(entry.path(), std::ios::binary);
+            uint32_t magic = 0, version = 0;
+            in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            in.read(reinterpret_cast<char*>(&version), sizeof(version));
+            SELFTEST_CHECK(magic == 0x48533343u && version == 3u,
+                "Invalid shader cache header in %s (magic=0x%08X version=%u)",
+                entry.path().string().c_str(), magic, version);
+            cachedFilesFound++;
+        }
+        SELFTEST_CHECK(cachedFilesFound == 2,
+            "Expected 2 shader cache files in %s, found %u",
+            shaderCacheDir.string().c_str(), cachedFilesFound);
+
+        printf("  [PASS] 2. RenderShaders worker compiled VS (%016llx) & PS (%016llx) and wrote %u disk cache entries\n",
+            (unsigned long long)vsProg->hash, (unsigned long long)psProg->hash, cachedFilesFound);
+
+        // --------------------------------------------------------------------
+        // 3. Execute a synthetic draw command (DI_PT_RECTLIST rectangle list
+        //    expansion + vertex buffer upload + constant ring + pipeline state)
+        //    followed by Render::Resolve (1x and 4x MSAA) and read back pixels.
+        // --------------------------------------------------------------------
+        constexpr uint32_t VbPhysAddr      = 0x00200000u;
+        constexpr uint32_t ResolvePhys1x   = 0x00300000u;
+        constexpr uint32_t ResolvePhysMsaa = 0x00380000u;
+
+        auto writeGuestFloat = [](uint32_t physAddr, float v) {
+            uint32_t bits = 0;
+            memcpy(&bits, &v, sizeof(bits));
+            Guest::Write32(Guest::Base, Guest::PhysicalAlias(physAddr), bits);
+        };
+
+        // 3 vertices for a 64x64 screen-space rectangle list (4th vertex is synthesized by rect_main):
+        //   v0 = (0,  0,  0.5, 1)
+        //   v1 = (64, 0,  0.5, 1)
+        //   v2 = (0,  64, 0.5, 1)
+        const float rectVerts[3][4] = {
+            {  0.0f,  0.0f, 0.5f, 1.0f },
+            { 64.0f,  0.0f, 0.5f, 1.0f },
+            {  0.0f, 64.0f, 0.5f, 1.0f },
+        };
+        for (uint32_t v = 0; v < 3; ++v)
+            for (uint32_t c = 0; c < 4; ++c)
+                writeGuestFloat(VbPhysAddr + (v * 4 + c) * 4, rectVerts[v][c]);
+
+        auto writeReg = [](uint32_t regIndex, uint32_t value) {
+            Gpu::WriteRegister(Gpu::ApertureBase + regIndex * 4u, value);
+        };
+        auto writeRegFloat = [&](uint32_t regIndex, float value) {
+            uint32_t bits = 0;
+            memcpy(&bits, &value, sizeof(bits));
+            writeReg(regIndex, bits);
+        };
+
+        // Configure Xenos registers for a 64x64 surface draw.
+        writeReg(RenderState::SurfaceInfo,        64u);                      // pitch = 64, 1x MSAA
+        writeReg(RenderState::ColorInfo0,         0u);                       // tile 0, format 0 (RGBA8)
+        writeReg(RenderState::DepthInfo,          0u);
+        writeReg(RenderState::WindowOffset,       0u);
+        writeReg(RenderState::ScissorTopLeft,     0u);
+        writeReg(RenderState::ScissorBottomRight, (64u << 16) | 64u);
+        writeReg(RenderState::ColorMask,          0x0000000Fu);              // write RGBA on RT0
+        writeReg(RenderState::ModeControl,        4u);                       // color + depth mode
+        writeReg(RenderState::DepthControl,       (7u << 4) | (1u << 2) | (1u << 1)); // Z enable, write, ALWAYS
+        writeReg(RenderState::BlendControl0,      0x00010001u);              // opaque (ONE, ZERO)
+        writeReg(RenderState::BlendControl1,      0x00010001u);
+        writeReg(RenderState::BlendControl2,      0x00010001u);
+        writeReg(RenderState::BlendControl3,      0x00010001u);
+        writeReg(RenderState::SuScModeControl,    0u);                       // cull none
+        writeReg(RenderState::VteControl,         0x100u);                   // pre-scaled screen coords (ww = 1.0)
+        writeReg(RenderState::VertexControl,      1u);                       // exact pixel centers
+        writeReg(RenderState::ColorControl,       0u);                       // alpha test off
+        writeReg(RenderState::IndexOffset,        0u);
+        writeReg(RenderState::MinVertexIndex,     0u);
+        writeReg(RenderState::MaxVertexIndex,     2u);
+
+        // Vertex fetch constant slot 0: base = VbPhysAddr, size = 12 dwords (3 vertices * 4 dwords), endian = 2
+        writeReg(RenderState::FetchConstants + 0, VbPhysAddr);
+        writeReg(RenderState::FetchConstants + 1, (12u << 2) | 2u);
+
+        // Vertex constants: c[0] = (0, 0, 0, 0), c[1] = (0.25, 0.5, 0.75, 1.0)
+        for (uint32_t i = 0; i < 4; ++i)
+            writeRegFloat(RenderState::VertexConstants + i, 0.0f);
+        writeRegFloat(RenderState::VertexConstants + 4 + 0, 0.25f);
+        writeRegFloat(RenderState::VertexConstants + 4 + 1, 0.50f);
+        writeRegFloat(RenderState::VertexConstants + 4 + 2, 0.75f);
+        writeRegFloat(RenderState::VertexConstants + 4 + 3, 1.00f);
+
+        // Pixel constants: c[0] = (0.50, 0.0, 0.0, 0.0)
+        // Expected output color oC0 = c_vs[1] + c_ps[0] = (0.75, 0.50, 0.75, 1.0) -> RGBA (191, 128, 191, 255)
+        writeRegFloat(RenderState::PixelConstants + 0, 0.50f);
+        writeRegFloat(RenderState::PixelConstants + 1, 0.00f);
+        writeRegFloat(RenderState::PixelConstants + 2, 0.00f);
+        writeRegFloat(RenderState::PixelConstants + 3, 0.00f);
+
+        // Initiator: primitive = Rectangles (8), sourceSelect = 2 (auto-index), indexCount = 3
+        const uint32_t rectInitiator = (3u << 16) | (2u << 6) | uint32_t(RenderState::Rectangles);
+        Render::Draw(rectInitiator, 0u, 0u);
+
+        // Resolve the 64x64 color target to ResolvePhys1x and clear RT0 afterward.
+        writeReg(RenderState::CopyControl,    (1u << 8) | (1u << 9));        // copy RT0 + clear color & depth
+        writeReg(RenderState::CopyDestBase,   ResolvePhys1x);
+        writeReg(RenderState::CopyDestPitch,  64u);
+        writeReg(RenderState::CopyDestInfo,   0u);
+        writeReg(RenderState::CopyColorClear, 0xFF000000u);
+        writeReg(RenderState::CopyDepthClear, 0xFFFFFF00u);
+        Render::Resolve();
+
+        auto readbackAndVerify = [&](uint32_t resolvedPhysAddr, uint8_t expR, uint8_t expG, uint8_t expB, uint8_t expA, const char* label) -> bool {
+            const RenderResources::Resolved* resolved = RenderResources::ResolvedAt(resolvedPhysAddr);
+            if (resolved == nullptr || resolved->texture == nullptr)
+            {
+                fprintf(stderr, "  [FAIL] ResolvedAt(0x%08X) returned null for %s\n", resolvedPhysAddr, label);
+                return false;
+            }
+            ComPtr<ID3D11Device> device;
+            resolved->texture->GetDevice(&device);
+            if (!device)
+            {
+                fprintf(stderr, "  [FAIL] GetDevice() returned null for %s\n", label);
+                return false;
+            }
+            ComPtr<ID3D11DeviceContext> context;
+            device->GetImmediateContext(&context);
+            if (!context)
+            {
+                fprintf(stderr, "  [FAIL] GetImmediateContext() returned null for %s\n", label);
+                return false;
+            }
+
+            D3D11_TEXTURE2D_DESC desc{};
+            resolved->texture->GetDesc(&desc);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            desc.MiscFlags = 0;
+
+            ComPtr<ID3D11Texture2D> staging;
+            if (FAILED(device->CreateTexture2D(&desc, nullptr, &staging)) || !staging)
+            {
+                fprintf(stderr, "  [FAIL] CreateTexture2D(STAGING) failed for %s\n", label);
+                return false;
+            }
+            context->CopyResource(staging.Get(), resolved->texture);
+
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)) || mapped.pData == nullptr)
+            {
+                fprintf(stderr, "  [FAIL] Map(STAGING) failed for %s\n", label);
+                return false;
+            }
+
+            // Sample center pixel (32, 32) and corner pixel (48, 48) (which lies in the synthesized 2nd triangle of the rectangle list!)
+            const uint32_t coords[2][2] = { { 32u, 32u }, { 48u, 48u } };
+            bool ok = true;
+            for (const auto& pt : coords)
+            {
+                const uint8_t* px = static_cast<const uint8_t*>(mapped.pData) + pt[1] * mapped.RowPitch + pt[0] * 4u;
+                const int dr = std::abs(int(px[0]) - int(expR));
+                const int dg = std::abs(int(px[1]) - int(expG));
+                const int db = std::abs(int(px[2]) - int(expB));
+                const int da = std::abs(int(px[3]) - int(expA));
+                if (dr > 2 || dg > 2 || db > 2 || da > 2)
+                {
+                    fprintf(stderr, "  [FAIL] %s pixel (%u,%u) RGBA=(%u,%u,%u,%u), expected (%u,%u,%u,%u)\n",
+                        label, pt[0], pt[1], px[0], px[1], px[2], px[3], expR, expG, expB, expA);
+                    ok = false;
+                }
+            }
+            context->Unmap(staging.Get(), 0);
+            return ok;
+        };
+
+        SELFTEST_CHECK(readbackAndVerify(ResolvePhys1x, 191, 128, 191, 255, "1x DI_PT_RECTLIST resolve"),
+            "1x rectangle-list draw + resolve pixel verification failed");
+        printf("  [PASS] 3. 1x DI_PT_RECTLIST draw (synthesizing 4th corner) + Render::Resolve verified RGBA=(191,128,191,255)\n");
+
+        // --------------------------------------------------------------------
+        // 4. Test 4x MSAA render target draw + multisampled shader resolve.
+        // --------------------------------------------------------------------
+        RenderResources::RequestMultisample(4);
+        RenderResources::BeginFrame(2);
+
+        // SurfaceInfo with MSAA bits (1 << 16) selects the MSAA target class; update pixel constant c[0] to (0.0, 0.25, 0.0, 0.0)
+        // so expected color is (0.25, 0.75, 0.75, 1.0) -> RGBA (64, 191, 191, 255).
+        writeReg(RenderState::SurfaceInfo, 64u | (1u << 16));
+        writeRegFloat(RenderState::PixelConstants + 0, 0.00f);
+        writeRegFloat(RenderState::PixelConstants + 1, 0.25f);
+        writeRegFloat(RenderState::PixelConstants + 2, 0.00f);
+        writeRegFloat(RenderState::PixelConstants + 3, 0.00f);
+
+        Render::Draw(rectInitiator, 0u, 0u);
+
+        writeReg(RenderState::CopyDestBase, ResolvePhysMsaa);
+        Render::Resolve();
+
+        const RenderResources::ColorTarget* msaaTarget =
+            RenderResources::ColorTargetOf(RenderResources::ColorTargetFor(0u, 64u | (1u << 16)));
+        SELFTEST_CHECK(msaaTarget != nullptr && msaaTarget->samples >= 2,
+            "Expected MSAA ColorTarget to have >= 2 samples (got %u)",
+            msaaTarget ? msaaTarget->samples : 0u);
+        SELFTEST_CHECK(readbackAndVerify(ResolvePhysMsaa, 64, 191, 191, 255, "4x MSAA resolve"),
+            "4x MSAA draw + resolve pixel verification failed");
+        printf("  [PASS] 4. %ux MSAA render target draw + multisampled Render::Resolve verified RGBA=(64,191,191,255)\n",
+            msaaTarget->samples);
+
+        const RenderPipeline::Statistics pipeStats = RenderPipeline::Stats();
+        const RenderResources::Statistics resStats = RenderResources::Stats();
+        SELFTEST_CHECK(pipeStats.blendStates >= 1 && pipeStats.depthStates >= 1 && pipeStats.rasterizerStates >= 1,
+            "Expected pipeline state caches to be populated (blend=%u depth=%u rast=%u)",
+            pipeStats.blendStates, pipeStats.depthStates, pipeStats.rasterizerStates);
+        SELFTEST_CHECK(resStats.buffers >= 1 && resStats.colorTargets >= 1 && resStats.depthTargets >= 1 && resStats.resolved >= 2,
+            "Expected resource caches to be populated (buffers=%u colorTargets=%u depthTargets=%u resolved=%u)",
+            resStats.buffers, resStats.colorTargets, resStats.depthTargets, resStats.resolved);
+
+        Guest::Shutdown();
+        printf("=== Gate 5 Self-Test: ALL RENDER ASSERTIONS PASSED ===\n");
+        fflush(stdout);
+        return 0;
+    }
 }
 
 namespace SelfTest
@@ -785,12 +1180,18 @@ namespace SelfTest
             if (rc != 0 || suite == "runtime")
                 return rc;
         }
-        if (suite == "render" || suite == "audio")
+        if (suite == "render" || suite == "all")
+        {
+            const int rc = RunRenderSelfTest();
+            if (rc != 0 || suite == "render")
+                return rc;
+        }
+        if (suite == "audio")
         {
             fprintf(stderr, "Self-test suite '%s' is not implemented yet.\n", suite.c_str());
             return 1;
         }
-        if (suite != "vm" && suite != "runtime" && suite != "all")
+        if (suite != "vm" && suite != "runtime" && suite != "render" && suite != "all")
         {
             fprintf(stderr, "Unknown self-test suite '%s' (expected vm, runtime, render, audio, or all).\n",
                 suite.c_str());
