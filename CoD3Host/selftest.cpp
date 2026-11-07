@@ -787,12 +787,26 @@ namespace
 
         using Microsoft::WRL::ComPtr;
 
-        // Isolate shader disk cache in a temporary directory for this self-test.
+        // Isolate shader disk cache and captured shader microcode in a temporary directory for this self-test.
         const std::filesystem::path tempCacheRoot =
             std::filesystem::temp_directory_path() / "cod3_gate5_shader_cache";
         std::error_code ec;
+        const std::filesystem::path origCwd = std::filesystem::current_path(ec);
         std::filesystem::remove_all(tempCacheRoot, ec);
         std::filesystem::create_directories(tempCacheRoot, ec);
+        std::filesystem::current_path(tempCacheRoot, ec);
+        struct ScopedTempDirCleanup
+        {
+            std::filesystem::path origCwd;
+            std::filesystem::path tempRoot;
+            ~ScopedTempDirCleanup()
+            {
+                std::error_code cleanupEc;
+                if (!origCwd.empty())
+                    std::filesystem::current_path(origCwd, cleanupEc);
+                std::filesystem::remove_all(tempRoot, cleanupEc);
+            }
+        } tempDirGuard{ origCwd, tempCacheRoot };
 #ifndef _WIN32
         setenv("LOCALAPPDATA", tempCacheRoot.string().c_str(), 1);
         setenv("COD3_NOPRECOMPILE", "1", 1);
@@ -1143,8 +1157,6 @@ namespace
             "Expected resource caches to be populated (buffers=%u colorTargets=%u depthTargets=%u resolved=%u)",
             resStats.buffers, resStats.colorTargets, resStats.depthTargets, resStats.resolved);
 
-        std::filesystem::remove_all(tempCacheRoot, ec);
-        std::filesystem::remove_all(std::filesystem::current_path() / "shaders", ec);
         Guest::Shutdown();
         printf("=== Gate 5 Self-Test: ALL RENDER ASSERTIONS PASSED ===\n");
         fflush(stdout);

@@ -90,6 +90,8 @@ elseif (APPLE)
     target_sources(CoD3 PRIVATE
         "platform_macos.mm"
         "d3d11_macos/d3d11_macos.mm")
+    set_source_files_properties("d3d11_macos/d3d11_macos.mm"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_include_directories(CoD3 PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/d3d11_macos/include"
         "/opt/homebrew/include")

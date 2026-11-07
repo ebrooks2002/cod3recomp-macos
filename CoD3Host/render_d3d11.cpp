@@ -1144,7 +1144,11 @@ namespace
     void PresentLocked(const Settings::Values& settings)
     {
         Timed timed(RenderStats::Frame().presentNanoseconds);
-        if (!SwapChainReady() || !BuiltInPrograms()) return;
+        if (!SwapChainReady() || !BuiltInPrograms())
+        {
+            if (g_context) g_context->Flush();
+            return;
+        }
         const int clientWidth = g_swapChainWidth, clientHeight = g_swapChainHeight;
         const float black[4] = { 0, 0, 0, 1 };
         g_context->ClearRenderTargetView(g_backView.Get(), black);

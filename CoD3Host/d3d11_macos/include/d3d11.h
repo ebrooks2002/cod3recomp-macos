@@ -565,6 +565,7 @@ struct ID3D11DeviceContext : public ID3D11DeviceChild {
     virtual void RSGetState(ID3D11RasterizerState** ppRasterizerState) = 0;
     virtual void RSGetViewports(UINT* pNumViewports, D3D11_VIEWPORT* pViewports) = 0;
     virtual void RSGetScissorRects(UINT* pNumRects, D3D11_RECT* pRects) = 0;
+    virtual void Flush() {}
 };
 
 struct ID3D11Device : public IUnknown {
