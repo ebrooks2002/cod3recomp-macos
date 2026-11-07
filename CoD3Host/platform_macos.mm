@@ -1712,6 +1712,9 @@ namespace Input
 
 namespace Overlay
 {
+    COD3_WEAK void Initialize(void*, ID3D11Device*, ID3D11DeviceContext*) {}
+    COD3_WEAK void Render(ID3D11RenderTargetView*, ID3D11Texture2D*, int, int) {}
+    COD3_WEAK void NoteFrame() {}
     COD3_WEAK void NoteFrontEndText(FrontEndText) {}
 }
 
@@ -1732,34 +1735,6 @@ namespace Xma
     COD3_WEAK void Destroy(Stream*) {}
     COD3_WEAK bool Decode(Stream*, const uint8_t*, std::vector<int16_t>&) { return false; }
     COD3_WEAK void Reset(Stream*) {}
-}
-
-namespace Render
-{
-    COD3_WEAK bool Enabled() { return false; }
-    COD3_WEAK void Draw(uint32_t, uint32_t, uint32_t) {}
-    COD3_WEAK void Resolve() {}
-    COD3_WEAK void ShaderLoaded(bool, uint32_t, uint32_t, uint32_t) {}
-    COD3_WEAK void UseProgram(bool, uint32_t, uint32_t, uint64_t) {}
-    COD3_WEAK void Swap(uint32_t, uint32_t, uint32_t) {}
-    COD3_WEAK void SetWindow(void*, int, int) {}
-    COD3_WEAK void PresentIdle() {}
-    COD3_WEAK void MemoryFreed(uint32_t, uint32_t) {}
-    COD3_WEAK uint64_t CurrentProgramHash(bool) { return 0; }
-    COD3_WEAK void LogNextFrame() {}
-    COD3_WEAK void Report() {}
-}
-
-namespace RenderInternal
-{
-    COD3_WEAK bool FrameLogged() { return false; }
-    COD3_WEAK uint64_t Swaps() { return 0; }
-    COD3_WEAK int DumpNumber() { return 0; }
-}
-
-namespace RenderShaders
-{
-    COD3_WEAK uint64_t HashMicrocode(const uint8_t*, uint32_t) { return 0; }
 }
 
 #endif // __APPLE__

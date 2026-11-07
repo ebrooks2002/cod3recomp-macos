@@ -68,16 +68,16 @@ add_executable(CoD3 WIN32
     "sampler.cpp"
     "watchpoint.cpp"
     "watchdog.cpp"
-    "coroutines.cpp")
+    "coroutines.cpp"
+    "render_d3d11.cpp"
+    "render_commands.cpp"
+    "render_pipeline.cpp"
+    "render_shaders.cpp"
+    "render_resources.cpp"
+    "render_stats.cpp")
 
 if (WIN32)
     target_sources(CoD3 PRIVATE
-        "render_d3d11.cpp"
-        "render_commands.cpp"
-        "render_pipeline.cpp"
-        "render_shaders.cpp"
-        "render_resources.cpp"
-        "render_stats.cpp"
         "window.cpp"
         "input.cpp"
         "overlay.cpp"
@@ -87,7 +87,12 @@ if (WIN32)
         "xma.cpp"
         "resources/CoD3.rc")
 elseif (APPLE)
-    target_sources(CoD3 PRIVATE "platform_macos.mm")
+    target_sources(CoD3 PRIVATE
+        "platform_macos.mm"
+        "d3d11_macos/d3d11_macos.mm")
+    target_include_directories(CoD3 PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/d3d11_macos/include"
+        "/opt/homebrew/include")
 endif()
 
 # A console application: setup is interactive and the import trap has to be
@@ -110,9 +115,22 @@ if (WIN32)
         windowscodecs   # screenshots as PNG
         shell32)
 elseif (APPLE)
+    target_link_directories(CoD3 PRIVATE
+        "/opt/homebrew/lib"
+        "/opt/homebrew/opt/glslang/lib"
+        "/opt/homebrew/opt/spirv-cross/lib")
     target_link_libraries(CoD3 PRIVATE
         "-framework Foundation"
-        "-framework AppKit")
+        "-framework AppKit"
+        "-framework Metal"
+        "-framework QuartzCore"
+        SDL2
+        glslang
+        SPIRV
+        glslang-default-resource-limits
+        spirv-cross-msl
+        spirv-cross-glsl
+        spirv-cross-core)
 endif()
 
 # Decompiled functions, from a CoD3Decomp checkout beside this repository (or

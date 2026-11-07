@@ -36,7 +36,7 @@
 #include <string>
 #include <vector>
 
-#include <Windows.h>
+#include "platform.h"
 #include <d3d11_1.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
@@ -355,8 +355,12 @@ namespace
         if (g_started) return !g_failed;
         g_started = true;
 
+#ifdef _WIN32
         HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
         if (compiler != nullptr) g_compile = reinterpret_cast<CompileFunction>(GetProcAddress(compiler, "D3DCompile"));
+#else
+        g_compile = &D3DCompile;
+#endif
         if (g_compile == nullptr)
         {
             printf("render: d3dcompiler_47.dll is not available; nothing can be drawn\n");
@@ -372,7 +376,7 @@ namespace
             levels, 1, D3D11_SDK_VERSION, &g_device, &level, &g_context);
         if (FAILED(hr))
         {
-            printf("render: no Direct3D 11 device (0x%08lX); nothing can be drawn\n", hr);
+            printf("render: no Direct3D 11 device (0x%08lX); nothing can be drawn\n", static_cast<unsigned long>(hr));
             g_failed = true;
             return false;
         }
@@ -1177,7 +1181,7 @@ namespace
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
         {
             static bool announced = false;
-            if (!announced) { announced = true; printf("render: the device was lost (0x%08lX); nothing more can be drawn\n", hr); }
+            if (!announced) { announced = true; printf("render: the device was lost (0x%08lX); nothing more can be drawn\n", static_cast<unsigned long>(hr)); }
             g_failed = true;
         }
         g_lastPresent.store(uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));

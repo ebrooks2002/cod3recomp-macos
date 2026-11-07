@@ -27,8 +27,13 @@
 #include <tuple>
 #include <vector>
 
+#include "platform.h"
 #include <d3d11_1.h>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 using RenderState::Handle;
 using RenderState::DrawCommand;
@@ -143,12 +148,21 @@ namespace
     void Swap16Into(uint16_t* to, const uint16_t* from, uint32_t count)
     {
         uint32_t i = 0;
+#if defined(__x86_64__) || defined(_M_X64)
         for (; i + 8 <= count; i += 8)
         {
             __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(from + i));
             v = _mm_or_si128(_mm_slli_epi16(v, 8), _mm_srli_epi16(v, 8));
             _mm_storeu_si128(reinterpret_cast<__m128i*>(to + i), v);
         }
+#elif defined(__aarch64__)
+        for (; i + 8 <= count; i += 8)
+        {
+            uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(from + i));
+            v = vrev16q_u8(v);
+            vst1q_u8(reinterpret_cast<uint8_t*>(to + i), v);
+        }
+#endif
         for (; i < count; i++) to[i] = uint16_t(BSwap16(from[i]));
     }
 
@@ -156,6 +170,7 @@ namespace
     void Swap32Into(uint32_t* to, const uint32_t* from, uint32_t count)
     {
         uint32_t i = 0;
+#if defined(__x86_64__) || defined(_M_X64)
         for (; i + 4 <= count; i += 4)
         {
             __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(from + i));
@@ -164,6 +179,14 @@ namespace
             v = _mm_shufflehi_epi16(v, _MM_SHUFFLE(2, 3, 0, 1));
             _mm_storeu_si128(reinterpret_cast<__m128i*>(to + i), v);
         }
+#elif defined(__aarch64__)
+        for (; i + 4 <= count; i += 4)
+        {
+            uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(from + i));
+            v = vrev32q_u8(v);
+            vst1q_u8(reinterpret_cast<uint8_t*>(to + i), v);
+        }
+#endif
         for (; i < count; i++) to[i] = _byteswap_ulong(from[i]);
     }
 

@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "platform.h"
 #include <d3d11_1.h>
 #include <wrl/client.h>
 
