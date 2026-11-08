@@ -496,8 +496,34 @@ struct Cod3Buffer final : public ID3D11Buffer {
         return mtlBuffer ? static_cast<uint8_t*>([mtlBuffer contents]) : nullptr;
     }
 
+    // Set when the current backing buffer has been referenced by encoded GPU
+    // work. A CPU write to such a buffer would be seen by those earlier draws
+    // (Metal reads shared memory when the GPU executes, not when encoded), so
+    // the backing buffer is renamed first.
+    bool gpuReferenced = false;
+
     void Discard() {
         mtlBuffer = [mtlDevice newBufferWithLength:byteSize options:MTLResourceStorageModeShared];
+        gpuReferenced = false;
+    }
+
+    // Prepares [offset, offset + length) for a CPU write that must not be
+    // observed by previously encoded GPU work. If the backing buffer has been
+    // referenced, a new one is allocated and the bytes outside the written
+    // range are carried over, preserving D3D11 update ordering. The old
+    // buffer stays alive for as long as the command buffers referencing it.
+    void PrepareForCpuWrite(size_t offset, size_t length) {
+        if (!gpuReferenced || !mtlBuffer) return;
+        id<MTLBuffer> old = mtlBuffer;
+        mtlBuffer = [mtlDevice newBufferWithLength:byteSize options:MTLResourceStorageModeShared];
+        gpuReferenced = false;
+        if (!mtlBuffer) { mtlBuffer = old; return; }
+        const uint8_t* src = static_cast<const uint8_t*>([old contents]);
+        uint8_t* dst = static_cast<uint8_t*>([mtlBuffer contents]);
+        offset = std::min(offset, byteSize);
+        const size_t end = std::min(byteSize, offset + length);
+        if (offset > 0) std::memcpy(dst, src, offset);
+        if (end < byteSize) std::memcpy(dst + end, src + end, byteSize - end);
     }
 
     void GetDesc(D3D11_BUFFER_DESC* pDesc) override {
@@ -505,19 +531,50 @@ struct Cod3Buffer final : public ID3D11Buffer {
     }
 };
 
+struct Cod3Device;
+// Defined after Cod3Device. A device's private reference keeps it alive for
+// its child resources without being held by the immediate context's bindings,
+// so a texture bound to the context does not form a reference cycle.
+static void DeviceAddPrivateRef(Cod3Device* dev);
+static void DeviceReleasePrivateRef(Cod3Device* dev);
+static ID3D11Device* DeviceInterface(Cod3Device* dev);
+
 struct Cod3Texture2D final : public ID3D11Texture2D {
+    struct StagingSubresource {
+        size_t offset = 0;
+        uint32_t rowPitch = 0;
+        uint32_t rows = 0;
+    };
+
     D3D11_TEXTURE2D_DESC desc{};
     MTLPixelFormat mtlFormat = MTLPixelFormatRGBA8Unorm;
-    ID3D11Device* d3dDevice = nullptr;
+    Cod3Device* ownerDevice = nullptr;
     id<MTLDevice> mtlDevice = nil;
     id<MTLTexture> mtlTexture = nil;
     id<MTLBuffer> stagingBuffer = nil;
     uint32_t stagingRowPitch = 0;
+    std::vector<StagingSubresource> stagingSubresources;   // indexed by D3D11 subresource
 
     void GetDevice(ID3D11Device** ppDevice) override {
         if (!ppDevice) return;
+        ID3D11Device* d3dDevice = ownerDevice ? DeviceInterface(ownerDevice) : nullptr;
         if (d3dDevice) d3dDevice->AddRef();
         *ppDevice = d3dDevice;
+    }
+
+    void SetOwnerDevice(Cod3Device* dev) {
+        if (dev == ownerDevice) return;
+        if (dev) DeviceAddPrivateRef(dev);
+        if (ownerDevice) DeviceReleasePrivateRef(ownerDevice);
+        ownerDevice = dev;
+    }
+
+    ~Cod3Texture2D() override {
+        if (ownerDevice) DeviceReleasePrivateRef(ownerDevice);
+    }
+
+    const StagingSubresource* Staging(UINT subresource) const {
+        return subresource < stagingSubresources.size() ? &stagingSubresources[subresource] : nullptr;
     }
 
     Cod3Texture2D(id<MTLDevice> dev, const D3D11_TEXTURE2D_DESC& d, const D3D11_SUBRESOURCE_DATA* init)
@@ -528,10 +585,28 @@ struct Cod3Texture2D final : public ID3D11Texture2D {
         mtlFormat = ToMtlPixelFormat(desc.Format);
 
         if (desc.Usage == D3D11_USAGE_STAGING) {
-            uint32_t bpp = BytesPerPixel(mtlFormat);
-            stagingRowPitch = (desc.Width * bpp + 255u) & ~255u;
-            size_t totalBytes = size_t(stagingRowPitch) * std::max<uint32_t>(1u, desc.Height);
-            stagingBuffer = [dev newBufferWithLength:std::max<size_t>(totalBytes, 64) options:MTLResourceStorageModeShared];
+            // One region per subresource (mip-major within each array slice,
+            // matching D3D11CalcSubresource), so whole-resource copies and
+            // per-subresource maps each get their own storage.
+            uint32_t blockBytes = 0;
+            const bool compressed = IsBlockCompressed(desc.Format, blockBytes);
+            const uint32_t bpp = BytesPerPixel(mtlFormat);
+            size_t total = 0;
+            stagingSubresources.resize(size_t(desc.ArraySize) * desc.MipLevels);
+            for (uint32_t slice = 0; slice < desc.ArraySize; ++slice) {
+                for (uint32_t mip = 0; mip < desc.MipLevels; ++mip) {
+                    const uint32_t w = std::max<uint32_t>(1u, desc.Width >> mip);
+                    const uint32_t h = std::max<uint32_t>(1u, desc.Height >> mip);
+                    StagingSubresource& sub = stagingSubresources[size_t(slice) * desc.MipLevels + mip];
+                    const uint32_t rowBytes = compressed ? std::max<uint32_t>(1u, (w + 3) / 4) * blockBytes : w * bpp;
+                    sub.rowPitch = (rowBytes + 255u) & ~255u;
+                    sub.rows = compressed ? std::max<uint32_t>(1u, (h + 3) / 4) : h;
+                    sub.offset = total;
+                    total += (size_t(sub.rowPitch) * sub.rows + 255u) & ~size_t(255u);
+                }
+            }
+            stagingRowPitch = stagingSubresources.empty() ? 0 : stagingSubresources[0].rowPitch;
+            stagingBuffer = [dev newBufferWithLength:std::max<size_t>(total, 64) options:MTLResourceStorageModeShared];
             return;
         }
 
@@ -568,7 +643,10 @@ struct Cod3Texture2D final : public ID3D11Texture2D {
     void UploadInitialData(const D3D11_SUBRESOURCE_DATA* init) {
         uint32_t blockBytes = 0;
         const bool compressed = IsBlockCompressed(desc.Format, blockBytes);
-        const uint32_t faces = ((desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) && desc.ArraySize == 6) ? 6u : 1u;
+        // Every array slice (including the six faces of a cube) has its own
+        // initial data, mip-major within each slice. Multisampled textures
+        // are private storage and never reach here.
+        const uint32_t faces = (desc.SampleDesc.Count > 1) ? 1u : desc.ArraySize;
 
         for (uint32_t slice = 0; slice < faces; ++slice) {
             for (uint32_t mip = 0; mip < desc.MipLevels; ++mip) {
@@ -1146,6 +1224,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
     id<MTLDevice> mtlDevice = nil;
     id<MTLCommandQueue> cmdQueue = nil;
     id<MTLCommandBuffer> cmdBuffer = nil;
+    id<MTLCommandBuffer> lastSubmitted = nil;
     id<MTLRenderCommandEncoder> renderEncoder = nil;
     id<MTLSamplerState> defaultSampler = nil;
     id<MTLTexture> dummyTexture2D = nil;
@@ -1236,23 +1315,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
 
     ~Cod3DeviceContext() override {
         FlushAndWait();
-        if (inputLayout) inputLayout->Release();
-        for (auto*& b : vertexBuffers) if (b) b->Release();
-        if (indexBuffer) indexBuffer->Release();
-        if (vs) vs->Release();
-        if (ps) ps->Release();
-        if (gs) gs->Release();
-        for (auto*& b : vsCBs) if (b) b->Release();
-        for (auto*& b : psCBs) if (b) b->Release();
-        for (auto*& v : vsSRVs) if (v) v->Release();
-        for (auto*& v : psSRVs) if (v) v->Release();
-        for (auto*& s : vsSamplers) if (s) s->Release();
-        for (auto*& s : psSamplers) if (s) s->Release();
-        for (auto*& r : rtvs) if (r) r->Release();
-        if (dsv) dsv->Release();
-        if (blendState) blendState->Release();
-        if (depthStencilState) depthStencilState->Release();
-        if (rasterizerState) rasterizerState->Release();
+        UnbindAll();
     }
 
     HRESULT QueryInterface(REFIID riid, void** ppvObject) override {
@@ -1282,17 +1345,46 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
         EndRenderPass();
         if (cmdBuffer) {
             [cmdBuffer commit];
+            // Kept so FlushAndWait can wait for work submitted by an earlier
+            // Flush (e.g. CopyResource; Flush; Map(READ)). Command buffers on
+            // one queue complete in order, so the latest covers all earlier.
+            lastSubmitted = cmdBuffer;
             cmdBuffer = nil;
         }
     }
 
     void FlushAndWait() {
-        EndRenderPass();
-        if (cmdBuffer) {
-            [cmdBuffer commit];
-            [cmdBuffer waitUntilCompleted];
-            cmdBuffer = nil;
+        Flush();
+        if (lastSubmitted) {
+            [lastSubmitted waitUntilCompleted];
+            lastSubmitted = nil;
         }
+    }
+
+    // Releases every bound object. Used when the device's last external
+    // reference goes away, so bindings do not keep child resources (and, via
+    // them, the device) alive.
+    void UnbindAll() {
+        EndRenderPass();
+        auto drop = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
+        drop(inputLayout);
+        for (auto*& b : vertexBuffers) drop(b);
+        drop(indexBuffer);
+        drop(vs);
+        drop(ps);
+        drop(gs);
+        for (auto*& b : vsCBs) drop(b);
+        for (auto*& b : psCBs) drop(b);
+        for (auto*& v : vsSRVs) drop(v);
+        for (auto*& v : psSRVs) drop(v);
+        for (auto*& s : vsSamplers) drop(s);
+        for (auto*& s : psSamplers) drop(s);
+        for (auto*& r : rtvs) drop(r);
+        numRtvs = 0;
+        drop(dsv);
+        drop(blendState);
+        drop(depthStencilState);
+        drop(rasterizerState);
     }
 
     bool EnsureRenderPass() {
@@ -1505,6 +1597,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                         [renderEncoder setVertexBytes:cb->Data() + byteOff length:avail atIndex:b.mslSlot];
                     } else if (cb->mtlBuffer) {
                         [renderEncoder setVertexBuffer:cb->mtlBuffer offset:byteOff atIndex:b.mslSlot];
+                        cb->gpuReferenced = true;
                     } else {
                         [renderEncoder setVertexBuffer:dummyBuffer offset:0 atIndex:b.mslSlot];
                     }
@@ -1516,6 +1609,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                 Cod3ShaderResourceView* srv = (b.d3dSlot < 64) ? vsSRVs[b.d3dSlot] : nullptr;
                 if (srv && srv->buffer && srv->buffer->mtlBuffer) {
                     [renderEncoder setVertexBuffer:srv->buffer->mtlBuffer offset:srv->bufferByteOffset atIndex:b.mslSlot];
+                    srv->buffer->gpuReferenced = true;
                 } else {
                     [renderEncoder setVertexBuffer:dummyBuffer offset:0 atIndex:b.mslSlot];
                 }
@@ -1536,6 +1630,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
             for (UINT s = 0; s < 4; ++s) {
                 if (vertexBuffers[s] && vertexBuffers[s]->mtlBuffer) {
                     [renderEncoder setVertexBuffer:vertexBuffers[s]->mtlBuffer offset:vertexOffsets[s] atIndex:(30 - s)];
+                    vertexBuffers[s]->gpuReferenced = true;
                 }
             }
         }
@@ -1552,6 +1647,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                         [renderEncoder setFragmentBytes:cb->Data() + byteOff length:avail atIndex:b.mslSlot];
                     } else if (cb->mtlBuffer) {
                         [renderEncoder setFragmentBuffer:cb->mtlBuffer offset:byteOff atIndex:b.mslSlot];
+                        cb->gpuReferenced = true;
                     } else {
                         [renderEncoder setFragmentBuffer:dummyBuffer offset:0 atIndex:b.mslSlot];
                     }
@@ -1563,6 +1659,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                 Cod3ShaderResourceView* srv = (b.d3dSlot < 64) ? psSRVs[b.d3dSlot] : nullptr;
                 if (srv && srv->buffer && srv->buffer->mtlBuffer) {
                     [renderEncoder setFragmentBuffer:srv->buffer->mtlBuffer offset:srv->bufferByteOffset atIndex:b.mslSlot];
+                    srv->buffer->gpuReferenced = true;
                 } else {
                     [renderEncoder setFragmentBuffer:dummyBuffer offset:0 atIndex:b.mslSlot];
                 }
@@ -1824,10 +1921,11 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                                    instanceCount:1
                                       baseVertex:BaseVertexLocation
                                     baseInstance:0];
+            indexBuffer->gpuReferenced = true;
         }
     }
 
-    HRESULT Map(ID3D11Resource* pResource, UINT, D3D11_MAP MapType, UINT, D3D11_MAPPED_SUBRESOURCE* pMappedResource) override {
+    HRESULT Map(ID3D11Resource* pResource, UINT Subresource, D3D11_MAP MapType, UINT, D3D11_MAPPED_SUBRESOURCE* pMappedResource) override {
         if (!pResource || !pMappedResource) return E_INVALIDARG;
         if (auto* buf = dynamic_cast<Cod3Buffer*>(pResource)) {
             if (MapType == D3D11_MAP_READ) {
@@ -1843,11 +1941,12 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
             return S_OK;
         }
         if (auto* tex = dynamic_cast<Cod3Texture2D*>(pResource)) {
-            if (tex->stagingBuffer) {
+            const auto* sub = tex->Staging(Subresource);
+            if (tex->stagingBuffer && sub) {
                 FlushAndWait();
-                pMappedResource->pData = [tex->stagingBuffer contents];
-                pMappedResource->RowPitch = tex->stagingRowPitch;
-                pMappedResource->DepthPitch = tex->stagingRowPitch * tex->desc.Height;
+                pMappedResource->pData = static_cast<uint8_t*>([tex->stagingBuffer contents]) + sub->offset;
+                pMappedResource->RowPitch = sub->rowPitch;
+                pMappedResource->DepthPitch = sub->rowPitch * sub->rows;
                 return S_OK;
             }
         }
@@ -1870,6 +1969,9 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                 buf->Discard();
             }
             if (buf->Data() && offset + length <= buf->byteSize) {
+                // Draws already encoded against this buffer must keep seeing
+                // the old contents, as they would on D3D11.
+                buf->PrepareForCpuWrite(offset, length);
                 std::memcpy(buf->Data() + offset, pSrcData, length);
             }
             return;
@@ -2026,6 +2128,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
             size_t srcOff = pSrcBox ? pSrcBox->left : 0;
             size_t len = pSrcBox ? (pSrcBox->right - pSrcBox->left) : std::min(dstBuf->desc.ByteWidth, srcBuf->desc.ByteWidth);
             if (dstBuf->Data() && srcBuf->Data() && DstX + len <= dstBuf->byteSize && srcOff + len <= srcBuf->byteSize) {
+                dstBuf->PrepareForCpuWrite(DstX, len);
                 std::memcpy(dstBuf->Data() + DstX, srcBuf->Data() + srcOff, len);
             }
             return;
@@ -2047,15 +2150,24 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
 
         id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
         if (dstTex->stagingBuffer) {
-            [blit copyFromTexture:srcTex->mtlTexture
-                      sourceSlice:srcSlice
-                      sourceLevel:srcMip
-                     sourceOrigin:MTLOriginMake(srcX, srcY, 0)
-                       sourceSize:MTLSizeMake(w, h, 1)
-                         toBuffer:dstTex->stagingBuffer
-                destinationOffset:0
-           destinationBytesPerRow:dstTex->stagingRowPitch
-         destinationBytesPerImage:dstTex->stagingRowPitch * h];
+            const auto* sub = dstTex->Staging(DstSubresource);
+            if (sub) {
+                uint32_t blockBytes = 0;
+                const bool compressed = IsBlockCompressed(dstTex->desc.Format, blockBytes);
+                const size_t dstOffset = sub->offset +
+                    (compressed ? size_t(DstY / 4) * sub->rowPitch + size_t(DstX / 4) * blockBytes
+                                : size_t(DstY) * sub->rowPitch + size_t(DstX) * BytesPerPixel(dstTex->mtlFormat));
+                const uint32_t copyRows = compressed ? std::max<uint32_t>(1u, (h + 3) / 4) : h;
+                [blit copyFromTexture:srcTex->mtlTexture
+                          sourceSlice:srcSlice
+                          sourceLevel:srcMip
+                         sourceOrigin:MTLOriginMake(srcX, srcY, 0)
+                           sourceSize:MTLSizeMake(w, h, 1)
+                             toBuffer:dstTex->stagingBuffer
+                    destinationOffset:dstOffset
+               destinationBytesPerRow:sub->rowPitch
+             destinationBytesPerImage:size_t(sub->rowPitch) * copyRows];
+            }
         } else if (dstTex->mtlTexture) {
             [blit copyFromTexture:srcTex->mtlTexture
                       sourceSlice:srcSlice
@@ -2071,6 +2183,25 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
     }
 
     void CopyResource(ID3D11Resource* pDstResource, ID3D11Resource* pSrcResource) override {
+        auto* dstTex = dynamic_cast<Cod3Texture2D*>(pDstResource);
+        auto* srcTex = dynamic_cast<Cod3Texture2D*>(pSrcResource);
+        if (dstTex && srcTex) {
+            // D3D11 copies the whole resource: every mip level of every
+            // array slice (or cube face).
+            const uint32_t srcMips = std::max<uint32_t>(1u, srcTex->desc.MipLevels);
+            const uint32_t dstMips = std::max<uint32_t>(1u, dstTex->desc.MipLevels);
+            const uint32_t mips = std::min(srcMips, dstMips);
+            const uint32_t slices = (srcTex->desc.SampleDesc.Count > 1) ? 1u :
+                std::min(std::max<uint32_t>(1u, srcTex->desc.ArraySize),
+                         std::max<uint32_t>(1u, dstTex->desc.ArraySize));
+            for (uint32_t slice = 0; slice < slices; ++slice) {
+                for (uint32_t mip = 0; mip < mips; ++mip) {
+                    CopySubresourceRegion(pDstResource, slice * dstMips + mip, 0, 0, 0,
+                                          pSrcResource, slice * srcMips + mip, nullptr);
+                }
+            }
+            return;
+        }
         CopySubresourceRegion(pDstResource, 0, 0, 0, 0, pSrcResource, 0, nullptr);
     }
 
@@ -2303,6 +2434,14 @@ struct Cod3Device final : public ID3D11Device, public IDXGIDevice {
     id<MTLDevice> mtlDevice = nil;
     Cod3Adapter* adapter = nullptr;
     Cod3DeviceContext* immediateContext = nullptr;
+    // Two-level lifetime, as in D3D11: the external count (the ID3D11Device
+    // base's m_refCount; AddRef/Release override both IUnknown bases) is the
+    // application's; child resources hold private references. While the
+    // external count is non-zero it holds one private reference itself. When
+    // it reaches zero the immediate context's bindings are dropped (breaking
+    // device -> context -> view -> texture -> device cycles) and that private
+    // reference is released; the device is destroyed once no child holds one.
+    std::atomic<uint32_t> privateRefs{ 1 };
 
     Cod3Device(id<MTLDevice> dev, Cod3Adapter* adp) : mtlDevice(dev), adapter(adp) {
         if (adapter) adapter->AddRef();
@@ -2314,8 +2453,26 @@ struct Cod3Device final : public ID3D11Device, public IDXGIDevice {
         if (adapter) adapter->Release();
     }
 
-    uint32_t AddRef() override { return ID3D11Device::AddRef(); }
-    uint32_t Release() override { return ID3D11Device::Release(); }
+    void AddPrivateRef() { ++privateRefs; }
+    void ReleasePrivateRef() {
+        if (--privateRefs == 0) delete this;
+    }
+
+    uint32_t AddRef() override {
+        const uint32_t r = ++ID3D11Device::m_refCount;
+        // Revived by a child's GetDevice after the application released it.
+        if (r == 1) AddPrivateRef();
+        return r;
+    }
+
+    uint32_t Release() override {
+        const uint32_t r = --ID3D11Device::m_refCount;
+        if (r == 0) {
+            if (immediateContext) immediateContext->UnbindAll();
+            ReleasePrivateRef();
+        }
+        return r;
+    }
 
     HRESULT QueryInterface(REFIID riid, void** ppvObject) override {
         if (!ppvObject) return E_INVALIDARG;
@@ -2365,7 +2522,7 @@ struct Cod3Device final : public ID3D11Device, public IDXGIDevice {
     HRESULT CreateTexture2D(const D3D11_TEXTURE2D_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D) override {
         if (!pDesc || !ppTexture2D) return E_INVALIDARG;
         auto* tex = new Cod3Texture2D(mtlDevice, *pDesc, pInitialData);
-        tex->d3dDevice = this;
+        tex->SetOwnerDevice(this);
         if (pDesc->Usage != D3D11_USAGE_STAGING && !tex->mtlTexture) {
             tex->Release();
             return E_FAIL;
@@ -2506,6 +2663,10 @@ struct Cod3Device final : public ID3D11Device, public IDXGIDevice {
     }
 };
 
+static void DeviceAddPrivateRef(Cod3Device* dev) { dev->AddPrivateRef(); }
+static void DeviceReleasePrivateRef(Cod3Device* dev) { dev->ReleasePrivateRef(); }
+static ID3D11Device* DeviceInterface(Cod3Device* dev) { return static_cast<ID3D11Device*>(dev); }
+
 struct Cod3SwapChain final : public IDXGISwapChain2 {
     Cod3Device* device = nullptr;
     HWND hwnd = nullptr;
@@ -2556,6 +2717,7 @@ struct Cod3SwapChain final : public IDXGISwapChain2 {
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         backBuffer = new Cod3Texture2D(device->mtlDevice, td, nullptr);
+        backBuffer->SetOwnerDevice(device);
     }
 
     HRESULT GetParent(REFIID, void**) override { return E_FAIL; }
@@ -2587,13 +2749,19 @@ struct Cod3SwapChain final : public IDXGISwapChain2 {
         return S_OK;
     }
 
-    HRESULT Present(UINT, UINT) override {
+    HRESULT Present(UINT SyncInterval, UINT) override {
         if (!device || !device->immediateContext) return E_FAIL;
         Cod3DeviceContext* ctx = device->immediateContext;
         ctx->EndRenderPass();
         ctx->EnsureCommandBuffer();
 
         if (metalLayer && backBuffer && backBuffer->mtlTexture) {
+            // SyncInterval 0 (COD3_VSYNC=0 / vsync off, with tearing allowed)
+            // presents immediately; anything else waits for the display.
+            const BOOL wantSync = SyncInterval > 0 ? YES : NO;
+            if (metalLayer.displaySyncEnabled != wantSync) {
+                metalLayer.displaySyncEnabled = wantSync;
+            }
             @autoreleasepool {
                 id<CAMetalDrawable> drawable = [metalLayer nextDrawable];
                 if (drawable && drawable.texture) {
@@ -2615,9 +2783,7 @@ struct Cod3SwapChain final : public IDXGISwapChain2 {
             }
         }
 
-        [ctx->cmdBuffer commit];
-        [ctx->cmdBuffer waitUntilCompleted];
-        ctx->cmdBuffer = nil;
+        ctx->FlushAndWait();
         return S_OK;
     }
 
@@ -2904,9 +3070,18 @@ extern "C" HRESULT WINAPI D3DCompile(
                 std::string sem = msl.get_decoration_string(r.id, spv::DecorationHlslSemanticGOOGLE);
                 if (sem.empty()) sem = r.name;
                 uint16_t semIdx = 0;
-                while (!sem.empty() && std::isdigit(static_cast<unsigned char>(sem.back()))) {
-                    semIdx = uint16_t(sem.back() - '0');
-                    sem.pop_back();
+                // The whole numeric suffix is the index (TEXCOORD15 -> 15).
+                size_t digitsStart = sem.size();
+                while (digitsStart > 0 && std::isdigit(static_cast<unsigned char>(sem[digitsStart - 1]))) {
+                    --digitsStart;
+                }
+                if (digitsStart < sem.size()) {
+                    uint32_t value = 0;
+                    for (size_t i = digitsStart; i < sem.size(); ++i) {
+                        value = std::min<uint32_t>(value * 10u + uint32_t(sem[i] - '0'), 0xFFFFu);
+                    }
+                    semIdx = uint16_t(value);
+                    sem.erase(digitsStart);
                 }
                 ShaderInputBinding ib{};
                 std::strncpy(ib.semanticName, sem.c_str(), sizeof(ib.semanticName) - 1);
