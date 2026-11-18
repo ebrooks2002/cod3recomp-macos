@@ -1073,10 +1073,14 @@ namespace
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         }
-        SELFTEST_CHECK(vsProg->state.load(std::memory_order_acquire) == RenderShaders::State::Ready,
-            "Vertex shader failed to reach Ready state (problem='%s')", vsProg->problem.c_str());
-        SELFTEST_CHECK(psProg->state.load(std::memory_order_acquire) == RenderShaders::State::Ready,
-            "Pixel shader failed to reach Ready state (problem='%s')", psProg->problem.c_str());
+        const auto vsFinalState = vsProg->state.load(std::memory_order_acquire);
+        const auto psFinalState = psProg->state.load(std::memory_order_acquire);
+        SELFTEST_CHECK(vsFinalState == RenderShaders::State::Ready,
+            "Vertex shader failed to reach Ready state (problem='%s')",
+            vsFinalState == RenderShaders::State::Failed ? vsProg->problem.c_str() : "timed out");
+        SELFTEST_CHECK(psFinalState == RenderShaders::State::Ready,
+            "Pixel shader failed to reach Ready state (problem='%s')",
+            psFinalState == RenderShaders::State::Failed ? psProg->problem.c_str() : "timed out");
         SELFTEST_CHECK(vsProg->shader != nullptr && psProg->shader != nullptr,
             "Compiled shader device objects are null");
 
@@ -1757,7 +1761,55 @@ namespace
                     "Depth staging readback got z0=%f zMid=%f, expected 0.25", z0, zMid);
             }
 
-            printf("  [PASS] 7. Shim parity unit tests passed: (a) CB window 0-pad, (b) default RS cull, (c) empty scissor, (d) PSO UID, (e) UpdateSubresource ordering/mip, (f) QI E_NOINTERFACE, (g) GPU timestamps\n");
+            // (h) MipLevels == 0 full mip-chain calculation + GenerateMips, high VS SRV slots (>= 64),
+            //     adapter outliving factory, and immediate context outliving device pointer.
+            {
+                D3D11_TEXTURE2D_DESC autoMipDesc = rtDesc;
+                autoMipDesc.Width = 32;
+                autoMipDesc.Height = 32;
+                autoMipDesc.MipLevels = 0;
+                autoMipDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                autoMipDesc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+                ComPtr<ID3D11Texture2D> autoMipTex;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateTexture2D(&autoMipDesc, nullptr, &autoMipTex)) && autoMipTex,
+                    "CreateTexture2D(MipLevels=0) failed");
+                D3D11_TEXTURE2D_DESC queriedMipDesc{};
+                autoMipTex->GetDesc(&queriedMipDesc);
+                SELFTEST_CHECK(queriedMipDesc.MipLevels == 6,
+                    "Expected MipLevels=0 on 32x32 texture to resolve to 6 mips, got %u", queriedMipDesc.MipLevels);
+
+                ComPtr<ID3D11ShaderResourceView> autoMipSrv;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateShaderResourceView(autoMipTex.Get(), nullptr, &autoMipSrv)) && autoMipSrv,
+                    "CreateShaderResourceView(MipLevels=0) failed");
+                uCtx->GenerateMips(autoMipSrv.Get());
+
+                // Bind and unbind at Xenos vertex fetch slot t96 (>= 64)
+                ID3D11ShaderResourceView* hiSrv = autoMipSrv.Get();
+                uCtx->VSSetShaderResources(96, 1, &hiSrv);
+                ID3D11ShaderResourceView* nullSrv = nullptr;
+                uCtx->VSSetShaderResources(96, 1, &nullSrv);
+
+                // Adapter outliving factory
+                ComPtr<IDXGIFactory1> tempFac;
+                ComPtr<IDXGIAdapter1> tempAdp;
+                SELFTEST_CHECK(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&tempFac))) && tempFac, "CreateDXGIFactory1 failed");
+                SELFTEST_CHECK(SUCCEEDED(tempFac->EnumAdapters1(0, &tempAdp)) && tempAdp, "EnumAdapters1(0) failed");
+                tempFac.Reset();
+                ComPtr<IDXGIFactory1> parentFac;
+                SELFTEST_CHECK(SUCCEEDED(tempAdp->GetParent(IID_PPV_ARGS(&parentFac))) && parentFac,
+                    "Adapter->GetParent failed after initial factory reference was released");
+
+                // Immediate context outliving device reference (ppDevice == nullptr)
+                ComPtr<ID3D11DeviceContext> standaloneCtx;
+                SELFTEST_CHECK(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                    nullptr, 0, D3D11_SDK_VERSION, nullptr, nullptr, &standaloneCtx)) && standaloneCtx,
+                    "D3D11CreateDevice(ppDevice=nullptr) failed");
+                ComPtr<ID3D11Device> recoveredDev;
+                standaloneCtx->GetDevice(&recoveredDev);
+                SELFTEST_CHECK(recoveredDev != nullptr, "Context->GetDevice returned null after ppDevice=nullptr");
+            }
+
+            printf("  [PASS] 7. Shim parity unit tests passed: (a) CB window 0-pad, (b) default RS cull, (c) empty scissor, (d) PSO UID, (e) UpdateSubresource ordering/mip, (f) QI E_NOINTERFACE, (g) GPU timestamps, (h) MipLevels=0/SRV128/lifetimes\n");
 
 #ifdef __APPLE__
             // --------------------------------------------------------------------

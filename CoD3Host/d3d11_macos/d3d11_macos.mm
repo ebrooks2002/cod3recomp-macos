@@ -672,6 +672,14 @@ static void DeviceAddPrivateRef(Cod3Device* dev);
 static void DeviceReleasePrivateRef(Cod3Device* dev);
 static ID3D11Device* DeviceInterface(Cod3Device* dev);
 
+static uint32_t ComputeFullMipCount(uint32_t maxDim) {
+    uint32_t mips = 1;
+    for (uint32_t d = std::max<uint32_t>(1u, maxDim); d > 1u; d >>= 1u) {
+        ++mips;
+    }
+    return mips;
+}
+
 struct Cod3Texture2D final : public ID3D11Texture2D {
     struct StagingSubresource {
         size_t offset = 0;
@@ -722,9 +730,13 @@ struct Cod3Texture2D final : public ID3D11Texture2D {
 
     Cod3Texture2D(id<MTLDevice> dev, const D3D11_TEXTURE2D_DESC& d, const D3D11_SUBRESOURCE_DATA* init, id<MTLCommandQueue> uploadQueue = nil)
         : desc(d), mtlDevice(dev) {
-        if (desc.MipLevels == 0) desc.MipLevels = 1;
         if (desc.ArraySize == 0) desc.ArraySize = 1;
         if (desc.SampleDesc.Count == 0) desc.SampleDesc.Count = 1;
+        if (desc.MipLevels == 0) {
+            desc.MipLevels = (desc.SampleDesc.Count > 1)
+                ? 1u
+                : ComputeFullMipCount(std::max<uint32_t>(desc.Width, desc.Height));
+        }
         mtlFormat = ToMtlPixelFormat(desc.Format);
 
         if (desc.Usage == D3D11_USAGE_STAGING) {
@@ -841,7 +853,7 @@ struct Cod3Texture1D final : public ID3D11Texture1D {
 
     Cod3Texture1D(id<MTLDevice> dev, const D3D11_TEXTURE1D_DESC& d, const D3D11_SUBRESOURCE_DATA* init)
         : desc(d), mtlDevice(dev) {
-        if (desc.MipLevels == 0) desc.MipLevels = 1;
+        if (desc.MipLevels == 0) desc.MipLevels = ComputeFullMipCount(desc.Width);
         if (desc.ArraySize == 0) desc.ArraySize = 1;
         mtlFormat = ToMtlPixelFormat(desc.Format);
 
@@ -891,7 +903,7 @@ struct Cod3Texture3D final : public ID3D11Texture3D {
 
     Cod3Texture3D(id<MTLDevice> dev, const D3D11_TEXTURE3D_DESC& d, const D3D11_SUBRESOURCE_DATA* init)
         : desc(d), mtlDevice(dev) {
-        if (desc.MipLevels == 0) desc.MipLevels = 1;
+        if (desc.MipLevels == 0) desc.MipLevels = ComputeFullMipCount(std::max<uint32_t>({ desc.Width, desc.Height, desc.Depth }));
         mtlFormat = ToMtlPixelFormat(desc.Format);
 
         MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
@@ -1163,6 +1175,10 @@ struct ParsedShaderData {
         if (!bytecode || length < sizeof(ShaderBlobHeader)) return false;
         const auto* hdr = static_cast<const ShaderBlobHeader*>(bytecode);
         if (hdr->magic != kShaderMagic || hdr->version != kShaderVersion) return false;
+        if (hdr->cbCount > 1024 || hdr->srvBufCount > 1024 || hdr->srvTexCount > 1024 ||
+            hdr->samplerCount > 1024 || hdr->inputCount > 1024 || hdr->mslLength > (16u << 20)) {
+            return false;
+        }
 
         const size_t totalPairs = size_t(hdr->srvBufCount) +
                                   size_t(hdr->srvTexCount) + size_t(hdr->samplerCount);
@@ -1208,30 +1224,32 @@ struct ParsedShaderData {
             return true; // Geometry shader handled via vertex rect expansion
         }
 
-        NSError* err = nil;
-        MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-        if (@available(macOS 15.0, *)) {
-            opts.mathMode = MTLMathModeSafe;
-        } else {
+        @autoreleasepool {
+            NSError* err = nil;
+            MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+            if (@available(macOS 15.0, *)) {
+                opts.mathMode = MTLMathModeSafe;
+            } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            opts.fastMathEnabled = NO;
+                opts.fastMathEnabled = NO;
 #pragma clang diagnostic pop
-        }
-        NSString* src = [NSString stringWithUTF8String:mslSource.c_str()];
-        library = [dev newLibraryWithSource:src options:opts error:&err];
-        if (!library) {
-            fprintf(stderr, "d3d11_macos: Metal shader compile failed: %s\n",
-                    err ? [[err localizedDescription] UTF8String] : "unknown");
-            return false;
-        }
-        mainFunc = [library newFunctionWithName:@"main0"];
-        if (!mainFunc) {
-            NSArray<NSString*>* names = [library functionNames];
-            if ([names count] > 0) mainFunc = [library newFunctionWithName:names[0]];
-        }
-        if (flags & 1u) {
-            rectFunc = [library newFunctionWithName:@"main0_rect"];
+            }
+            NSString* src = [NSString stringWithUTF8String:mslSource.c_str()];
+            library = [dev newLibraryWithSource:src options:opts error:&err];
+            if (!library) {
+                fprintf(stderr, "d3d11_macos: Metal shader compile failed: %s\n",
+                        err ? [[err localizedDescription] UTF8String] : "unknown");
+                return false;
+            }
+            mainFunc = [library newFunctionWithName:@"main0"];
+            if (!mainFunc) {
+                NSArray<NSString*>* names = [library functionNames];
+                if ([names count] > 0) mainFunc = [library newFunctionWithName:names[0]];
+            }
+            if (flags & 1u) {
+                rectFunc = [library newFunctionWithName:@"main0_rect"];
+            }
         }
         return mainFunc != nil;
     }
@@ -1280,7 +1298,10 @@ struct Cod3InputLayout final : public ID3D11InputLayout {
         }
         if (bytecode && len >= sizeof(ShaderBlobHeader)) {
             const auto* hdr = static_cast<const ShaderBlobHeader*>(bytecode);
-            if (hdr->magic == kShaderMagic && hdr->version == kShaderVersion) {
+            if (hdr->magic == kShaderMagic && hdr->version == kShaderVersion &&
+                hdr->cbCount <= 1024 && hdr->srvBufCount <= 1024 &&
+                hdr->srvTexCount <= 1024 && hdr->samplerCount <= 1024 &&
+                hdr->inputCount <= 1024) {
                 const size_t cbBytes = size_t(hdr->cbCount) * sizeof(ShaderCBBinding);
                 const size_t pairsBytes = (size_t(hdr->srvBufCount) +
                                            size_t(hdr->srvTexCount) + size_t(hdr->samplerCount)) * sizeof(ShaderBindingPair);
@@ -1513,8 +1534,8 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
     Cod3Buffer* psCBs[16] = {};
     UINT psCBFirstConstant[16] = {};
     UINT psCBNumConstants[16] = {};
-    Cod3ShaderResourceView* vsSRVs[64] = {};
-    Cod3ShaderResourceView* psSRVs[64] = {};
+    Cod3ShaderResourceView* vsSRVs[128] = {};
+    Cod3ShaderResourceView* psSRVs[128] = {};
     Cod3SamplerState* vsSamplers[16] = {};
     Cod3SamplerState* psSamplers[16] = {};
 
@@ -1582,6 +1603,36 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
         UnbindAll();
     }
 
+    // Ref 1 is Cod3Device's internal pointer. While any external caller holds
+    // a reference (ref >= 2), keep an external reference on parentDevice so
+    // releasing the device first (or calling D3D11CreateDevice with
+    // ppDevice == nullptr) does not unbind or destroy the device while the
+    // immediate context is still in use.
+    uint32_t AddRef() override {
+        const uint32_t r = ++m_refCount;
+        if (r == 2 && parentDevice) {
+            DeviceInterface(parentDevice)->AddRef();
+        }
+        return r;
+    }
+
+    uint32_t Release() override {
+        const uint32_t r = --m_refCount;
+        if (r == 1 && parentDevice) {
+            DeviceInterface(parentDevice)->Release();
+        } else if (r == 0) {
+            delete this;
+        }
+        return r;
+    }
+
+    void GetDevice(ID3D11Device** ppDevice) override {
+        if (!ppDevice) return;
+        ID3D11Device* d3dDevice = parentDevice ? DeviceInterface(parentDevice) : nullptr;
+        if (d3dDevice) d3dDevice->AddRef();
+        *ppDevice = d3dDevice;
+    }
+
     HRESULT QueryInterface(REFIID riid, void** ppvObject) override {
         return Cod3QI<Cod3DeviceContext, ID3D11DeviceChild, ID3D11DeviceContext, ID3D11DeviceContext1>(this, riid, ppvObject);
     }
@@ -1642,46 +1693,48 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
     }
 
     void CommitCurrentCommandBuffer(bool frameEnd) {
-        EndRenderPass();
-        if (!cmdBuffer) return;
+        @autoreleasepool {
+            EndRenderPass();
+            if (!cmdBuffer) return;
 
-        if (activeUploadRing && activeUploadOffset > 0) {
-            retiredUploadRings.push_back(activeUploadRing);
-            activeUploadRing = nil;
-            activeUploadOffset = 0;
-        }
-
-        std::vector<id<MTLBuffer>> ringsToRecycle;
-        ringsToRecycle.swap(retiredUploadRings);
-
-        if ((frameEnd || !ringsToRecycle.empty()) && inFlight) {
-            std::shared_ptr<InFlightState> state = inFlight;
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                if (frameEnd) state->inFlightFrames++;
-                state->pendingCallbacks++;
+            if (activeUploadRing && activeUploadOffset > 0) {
+                retiredUploadRings.push_back(activeUploadRing);
+                activeUploadRing = nil;
+                activeUploadOffset = 0;
             }
-            [cmdBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                for (id<MTLBuffer> r : ringsToRecycle) {
-                    if (state->freeUploadRings.size() < 8) {
-                        state->freeUploadRings.push_back(r);
-                    }
-                }
-                if (frameEnd && state->inFlightFrames > 0) {
-                    state->inFlightFrames--;
-                }
-                if (state->pendingCallbacks > 0) {
-                    state->pendingCallbacks--;
-                }
-                state->cv.notify_all();
-            }];
-        }
 
-        [cmdBuffer commit];
-        lastSubmitted = cmdBuffer;
-        cmdBuffer = nil;
-        hasEncodedCommands = false;
+            std::vector<id<MTLBuffer>> ringsToRecycle;
+            ringsToRecycle.swap(retiredUploadRings);
+
+            if ((frameEnd || !ringsToRecycle.empty()) && inFlight) {
+                std::shared_ptr<InFlightState> state = inFlight;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (frameEnd) state->inFlightFrames++;
+                    state->pendingCallbacks++;
+                }
+                [cmdBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    for (id<MTLBuffer> r : ringsToRecycle) {
+                        if (state->freeUploadRings.size() < 8) {
+                            state->freeUploadRings.push_back(r);
+                        }
+                    }
+                    if (frameEnd && state->inFlightFrames > 0) {
+                        state->inFlightFrames--;
+                    }
+                    if (state->pendingCallbacks > 0) {
+                        state->pendingCallbacks--;
+                    }
+                    state->cv.notify_all();
+                }];
+            }
+
+            [cmdBuffer commit];
+            lastSubmitted = cmdBuffer;
+            cmdBuffer = nil;
+            hasEncodedCommands = false;
+        }
     }
 
     void Flush() override {
@@ -2069,7 +2122,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                 BindCB(true, b, cb, first, count);
             }
             for (const auto& b : vs->data.srvBufBindings) {
-                Cod3ShaderResourceView* srv = (b.d3dSlot < 64) ? vsSRVs[b.d3dSlot] : nullptr;
+                Cod3ShaderResourceView* srv = (b.d3dSlot < 128) ? vsSRVs[b.d3dSlot] : nullptr;
                 if (srv && srv->buffer && srv->buffer->mtlBuffer) {
                     [renderEncoder setVertexBuffer:srv->buffer->mtlBuffer offset:srv->bufferByteOffset atIndex:b.mslSlot];
                     srv->buffer->gpuReferenced = true;
@@ -2078,7 +2131,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                 }
             }
             for (const auto& b : vs->data.srvTexBindings) {
-                Cod3ShaderResourceView* srv = (b.d3dSlot < 64) ? vsSRVs[b.d3dSlot] : nullptr;
+                Cod3ShaderResourceView* srv = (b.d3dSlot < 128) ? vsSRVs[b.d3dSlot] : nullptr;
                 id<MTLTexture> tex = (srv && srv->mtlTexture) ? srv->mtlTexture : dummyTexture2D;
                 [renderEncoder setVertexTexture:tex atIndex:b.mslSlot];
             }
@@ -2107,7 +2160,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                 BindCB(false, b, cb, first, count);
             }
             for (const auto& b : ps->data.srvBufBindings) {
-                Cod3ShaderResourceView* srv = (b.d3dSlot < 64) ? psSRVs[b.d3dSlot] : nullptr;
+                Cod3ShaderResourceView* srv = (b.d3dSlot < 128) ? psSRVs[b.d3dSlot] : nullptr;
                 if (srv && srv->buffer && srv->buffer->mtlBuffer) {
                     [renderEncoder setFragmentBuffer:srv->buffer->mtlBuffer offset:srv->bufferByteOffset atIndex:b.mslSlot];
                     srv->buffer->gpuReferenced = true;
@@ -2116,7 +2169,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
                 }
             }
             for (const auto& b : ps->data.srvTexBindings) {
-                Cod3ShaderResourceView* srv = (b.d3dSlot < 64) ? psSRVs[b.d3dSlot] : nullptr;
+                Cod3ShaderResourceView* srv = (b.d3dSlot < 128) ? psSRVs[b.d3dSlot] : nullptr;
                 id<MTLTexture> tex = (srv && srv->mtlTexture) ? srv->mtlTexture : dummyTexture2D;
                 [renderEncoder setFragmentTexture:tex atIndex:b.mslSlot];
             }
@@ -2171,7 +2224,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
     }
 
     void VSSetShaderResources(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView* const* ppShaderResourceViews) override {
-        for (UINT i = 0; i < NumViews && (StartSlot + i) < 64; ++i) {
+        for (UINT i = 0; i < NumViews && (StartSlot + i) < 128; ++i) {
             Cod3ShaderResourceView* next = ppShaderResourceViews ? static_cast<Cod3ShaderResourceView*>(ppShaderResourceViews[i]) : nullptr;
             if (next) next->AddRef();
             if (vsSRVs[StartSlot + i]) vsSRVs[StartSlot + i]->Release();
@@ -2180,7 +2233,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
     }
 
     void PSSetShaderResources(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView* const* ppShaderResourceViews) override {
-        for (UINT i = 0; i < NumViews && (StartSlot + i) < 64; ++i) {
+        for (UINT i = 0; i < NumViews && (StartSlot + i) < 128; ++i) {
             Cod3ShaderResourceView* next = ppShaderResourceViews ? static_cast<Cod3ShaderResourceView*>(ppShaderResourceViews[i]) : nullptr;
             if (next) next->AddRef();
             if (psSRVs[StartSlot + i]) psSRVs[StartSlot + i]->Release();
@@ -2333,77 +2386,81 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
 
     void Draw(UINT VertexCount, UINT StartVertexLocation) override {
         if (VertexCount == 0) return;
-        bool useRect = false;
-        if (gs != nullptr) {
-            if (!vs || vs->data.rectFunc == nil) {
-                LogMissingRectEntryOnce();
-                return;
+        @autoreleasepool {
+            bool useRect = false;
+            if (gs != nullptr) {
+                if (!vs || vs->data.rectFunc == nil) {
+                    LogMissingRectEntryOnce();
+                    return;
+                }
+                if (VertexCount < 3) return;
+                useRect = true;
             }
-            if (VertexCount < 3) return;
-            useRect = true;
-        }
-        if (!PrepareDrawState(useRect)) return;
+            if (!PrepareDrawState(useRect)) return;
 
-        if (useRect) {
-            uint32_t rectCount = VertexCount / 3;
-            std::vector<uint32_t> rectIndices(rectCount * 3);
-            for (uint32_t i = 0; i < rectCount * 3; ++i) {
-                rectIndices[i] = StartVertexLocation + i;
-            }
-            if (rectIndices.size() * sizeof(uint32_t) <= 4096) {
-                [renderEncoder setVertexBytes:rectIndices.data() length:rectIndices.size() * sizeof(uint32_t) atIndex:29];
+            if (useRect) {
+                uint32_t rectCount = VertexCount / 3;
+                std::vector<uint32_t> rectIndices(rectCount * 3);
+                for (uint32_t i = 0; i < rectCount * 3; ++i) {
+                    rectIndices[i] = StartVertexLocation + i;
+                }
+                if (rectIndices.size() * sizeof(uint32_t) <= 4096) {
+                    [renderEncoder setVertexBytes:rectIndices.data() length:rectIndices.size() * sizeof(uint32_t) atIndex:29];
+                } else {
+                    id<MTLBuffer> idxBuf = [mtlDevice newBufferWithBytes:rectIndices.data() length:rectIndices.size() * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+                    [renderEncoder setVertexBuffer:idxBuf offset:0 atIndex:29];
+                }
+                [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:rectCount * 6];
             } else {
-                id<MTLBuffer> idxBuf = [mtlDevice newBufferWithBytes:rectIndices.data() length:rectIndices.size() * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-                [renderEncoder setVertexBuffer:idxBuf offset:0 atIndex:29];
+                [renderEncoder drawPrimitives:CurrentMtlPrimitiveType() vertexStart:StartVertexLocation vertexCount:VertexCount];
             }
-            [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:rectCount * 6];
-        } else {
-            [renderEncoder drawPrimitives:CurrentMtlPrimitiveType() vertexStart:StartVertexLocation vertexCount:VertexCount];
         }
     }
 
     void DrawIndexed(UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation) override {
         if (IndexCount == 0 || !indexBuffer || !indexBuffer->mtlBuffer) return;
-        bool useRect = false;
-        if (gs != nullptr) {
-            if (!vs || vs->data.rectFunc == nil) {
-                LogMissingRectEntryOnce();
-                return;
+        @autoreleasepool {
+            bool useRect = false;
+            if (gs != nullptr) {
+                if (!vs || vs->data.rectFunc == nil) {
+                    LogMissingRectEntryOnce();
+                    return;
+                }
+                if (IndexCount < 3) return;
+                useRect = true;
             }
-            if (IndexCount < 3) return;
-            useRect = true;
-        }
-        if (!PrepareDrawState(useRect)) return;
+            if (!PrepareDrawState(useRect)) return;
 
-        const bool is32 = (indexFormat == DXGI_FORMAT_R32_UINT);
-        const size_t elemSize = is32 ? 4 : 2;
-        const size_t byteOff = indexOffset + size_t(StartIndexLocation) * elemSize;
+            const bool is32 = (indexFormat == DXGI_FORMAT_R32_UINT);
+            const size_t elemSize = is32 ? 4 : 2;
+            const size_t byteOff = indexOffset + size_t(StartIndexLocation) * elemSize;
 
-        if (useRect) {
-            uint32_t rectCount = IndexCount / 3;
-            std::vector<uint32_t> rectIndices(rectCount * 3);
-            const uint8_t* raw = indexBuffer->Data() + byteOff;
-            for (uint32_t i = 0; i < rectCount * 3; ++i) {
-                uint32_t idx = is32 ? reinterpret_cast<const uint32_t*>(raw)[i] : reinterpret_cast<const uint16_t*>(raw)[i];
-                rectIndices[i] = uint32_t(int32_t(idx) + BaseVertexLocation);
-            }
-            if (rectIndices.size() * sizeof(uint32_t) <= 4096) {
-                [renderEncoder setVertexBytes:rectIndices.data() length:rectIndices.size() * sizeof(uint32_t) atIndex:29];
+            if (useRect) {
+                uint32_t rectCount = IndexCount / 3;
+                std::vector<uint32_t> rectIndices(rectCount * 3);
+                const uint8_t* raw = indexBuffer->Data() + byteOff;
+                for (uint32_t i = 0; i < rectCount * 3; ++i) {
+                    uint32_t idx = is32 ? reinterpret_cast<const uint32_t*>(raw)[i] : reinterpret_cast<const uint16_t*>(raw)[i];
+                    rectIndices[i] = uint32_t(int32_t(idx) + BaseVertexLocation);
+                }
+                if (rectIndices.size() * sizeof(uint32_t) <= 4096) {
+                    [renderEncoder setVertexBytes:rectIndices.data() length:rectIndices.size() * sizeof(uint32_t) atIndex:29];
+                } else {
+                    id<MTLBuffer> idxBuf = [mtlDevice newBufferWithBytes:rectIndices.data() length:rectIndices.size() * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+                    [renderEncoder setVertexBuffer:idxBuf offset:0 atIndex:29];
+                }
+                [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:rectCount * 6];
             } else {
-                id<MTLBuffer> idxBuf = [mtlDevice newBufferWithBytes:rectIndices.data() length:rectIndices.size() * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-                [renderEncoder setVertexBuffer:idxBuf offset:0 atIndex:29];
+                [renderEncoder drawIndexedPrimitives:CurrentMtlPrimitiveType()
+                                          indexCount:IndexCount
+                                           indexType:is32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                                         indexBuffer:indexBuffer->mtlBuffer
+                                   indexBufferOffset:byteOff
+                                       instanceCount:1
+                                          baseVertex:BaseVertexLocation
+                                        baseInstance:0];
+                indexBuffer->gpuReferenced = true;
             }
-            [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:rectCount * 6];
-        } else {
-            [renderEncoder drawIndexedPrimitives:CurrentMtlPrimitiveType()
-                                      indexCount:IndexCount
-                                       indexType:is32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
-                                     indexBuffer:indexBuffer->mtlBuffer
-                               indexBufferOffset:byteOff
-                                   instanceCount:1
-                                      baseVertex:BaseVertexLocation
-                                    baseInstance:0];
-            indexBuffer->gpuReferenced = true;
         }
     }
 
@@ -2460,105 +2517,109 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
 
     void UpdateSubresource1(ID3D11Resource* pDstResource, UINT DstSubresource, const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT, UINT CopyFlags) override {
         if (!pDstResource || !pSrcData) return;
-        if (auto* buf = dynamic_cast<Cod3Buffer*>(pDstResource)) {
-            size_t offset = pDstBox ? pDstBox->left : 0;
-            size_t length = pDstBox ? (pDstBox->right - pDstBox->left) : buf->desc.ByteWidth;
-            if ((CopyFlags & D3D11_COPY_DISCARD) != 0) {
-                buf->Discard();
+        @autoreleasepool {
+            if (auto* buf = dynamic_cast<Cod3Buffer*>(pDstResource)) {
+                size_t offset = pDstBox ? pDstBox->left : 0;
+                size_t length = pDstBox ? (pDstBox->right - pDstBox->left) : buf->desc.ByteWidth;
+                if ((CopyFlags & D3D11_COPY_DISCARD) != 0) {
+                    buf->Discard();
+                }
+                if (buf->Data() && offset + length <= buf->byteSize) {
+                    // Draws already encoded against this buffer must keep seeing
+                    // the old contents, as they would on D3D11.
+                    buf->PrepareForCpuWrite(offset, length);
+                    std::memcpy(buf->Data() + offset, pSrcData, length);
+                }
+                return;
             }
-            if (buf->Data() && offset + length <= buf->byteSize) {
-                // Draws already encoded against this buffer must keep seeing
-                // the old contents, as they would on D3D11.
-                buf->PrepareForCpuWrite(offset, length);
-                std::memcpy(buf->Data() + offset, pSrcData, length);
+            if (auto* tex = dynamic_cast<Cod3Texture2D*>(pDstResource)) {
+                if (!tex->mtlTexture || tex->desc.SampleDesc.Count > 1) return;
+                const uint32_t mipLevels = std::max<uint32_t>(1u, tex->desc.MipLevels);
+                const uint32_t mip = DstSubresource % mipLevels;
+                const uint32_t slice = DstSubresource / mipLevels;
+                if (mip >= mipLevels || slice >= std::max<uint32_t>(1u, tex->desc.ArraySize)) return;
+
+                const uint32_t mipW = std::max<uint32_t>(1u, tex->desc.Width >> mip);
+                const uint32_t mipH = std::max<uint32_t>(1u, tex->desc.Height >> mip);
+                const uint32_t x = pDstBox ? pDstBox->left : 0;
+                const uint32_t y = pDstBox ? pDstBox->top : 0;
+                const uint32_t w = pDstBox ? (pDstBox->right - pDstBox->left) : mipW;
+                const uint32_t h = pDstBox ? (pDstBox->bottom - pDstBox->top) : mipH;
+                if (w == 0 || h == 0 || x + w > mipW || y + h > mipH) return;
+
+                ConvertedImage img = ConvertRowsIfNeeded(tex->desc.Format, tex->mtlFormat, w, h, pSrcData, SrcRowPitch);
+                if (!img.data || img.totalBytes == 0) return;
+
+                id<MTLBuffer> stg = [mtlDevice newBufferWithBytes:img.data length:img.totalBytes options:MTLResourceStorageModeShared];
+                if (!stg) return;
+
+                EndRenderPass();
+                EnsureCommandBuffer();
+                hasEncodedCommands = true;
+                id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
+                [blit copyFromBuffer:stg
+                        sourceOffset:0
+                   sourceBytesPerRow:img.rowBytes
+                 sourceBytesPerImage:img.totalBytes
+                          sourceSize:MTLSizeMake(w, h, 1)
+                           toTexture:tex->mtlTexture
+                    destinationSlice:slice
+                    destinationLevel:mip
+                   destinationOrigin:MTLOriginMake(x, y, 0)];
+                [blit endEncoding];
+                return;
             }
-            return;
-        }
-        if (auto* tex = dynamic_cast<Cod3Texture2D*>(pDstResource)) {
-            if (!tex->mtlTexture || tex->desc.SampleDesc.Count > 1) return;
-            const uint32_t mipLevels = std::max<uint32_t>(1u, tex->desc.MipLevels);
-            const uint32_t mip = DstSubresource % mipLevels;
-            const uint32_t slice = DstSubresource / mipLevels;
-            if (mip >= mipLevels || slice >= std::max<uint32_t>(1u, tex->desc.ArraySize)) return;
+            if (auto* tex1 = dynamic_cast<Cod3Texture1D*>(pDstResource)) {
+                if (!tex1->mtlTexture) return;
+                const uint32_t mipLevels = std::max<uint32_t>(1u, tex1->desc.MipLevels);
+                const uint32_t mip = DstSubresource % mipLevels;
+                if (mip >= mipLevels) return;
+                const uint32_t mipW = std::max<uint32_t>(1u, tex1->desc.Width >> mip);
+                const uint32_t x = pDstBox ? pDstBox->left : 0;
+                const uint32_t w = pDstBox ? (pDstBox->right - pDstBox->left) : mipW;
+                if (w == 0 || x + w > mipW) return;
 
-            const uint32_t mipW = std::max<uint32_t>(1u, tex->desc.Width >> mip);
-            const uint32_t mipH = std::max<uint32_t>(1u, tex->desc.Height >> mip);
-            const uint32_t x = pDstBox ? pDstBox->left : 0;
-            const uint32_t y = pDstBox ? pDstBox->top : 0;
-            const uint32_t w = pDstBox ? (pDstBox->right - pDstBox->left) : mipW;
-            const uint32_t h = pDstBox ? (pDstBox->bottom - pDstBox->top) : mipH;
-            if (w == 0 || h == 0 || x + w > mipW || y + h > mipH) return;
+                ConvertedImage img = ConvertRowsIfNeeded(tex1->desc.Format, tex1->mtlFormat, w, 1, pSrcData, SrcRowPitch);
+                if (!img.data || img.totalBytes == 0) return;
 
-            ConvertedImage img = ConvertRowsIfNeeded(tex->desc.Format, tex->mtlFormat, w, h, pSrcData, SrcRowPitch);
-            if (!img.data || img.totalBytes == 0) return;
+                id<MTLBuffer> stg = [mtlDevice newBufferWithBytes:img.data length:img.totalBytes options:MTLResourceStorageModeShared];
+                if (!stg) return;
 
-            id<MTLBuffer> stg = [mtlDevice newBufferWithBytes:img.data length:img.totalBytes options:MTLResourceStorageModeShared];
-            if (!stg) return;
-
-            EndRenderPass();
-            EnsureCommandBuffer();
-            hasEncodedCommands = true;
-            id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
-            [blit copyFromBuffer:stg
-                    sourceOffset:0
-               sourceBytesPerRow:img.rowBytes
-             sourceBytesPerImage:img.totalBytes
-                      sourceSize:MTLSizeMake(w, h, 1)
-                       toTexture:tex->mtlTexture
-                destinationSlice:slice
-                destinationLevel:mip
-               destinationOrigin:MTLOriginMake(x, y, 0)];
-            [blit endEncoding];
-            return;
-        }
-        if (auto* tex1 = dynamic_cast<Cod3Texture1D*>(pDstResource)) {
-            if (!tex1->mtlTexture) return;
-            const uint32_t mipLevels = std::max<uint32_t>(1u, tex1->desc.MipLevels);
-            const uint32_t mip = DstSubresource % mipLevels;
-            if (mip >= mipLevels) return;
-            const uint32_t mipW = std::max<uint32_t>(1u, tex1->desc.Width >> mip);
-            const uint32_t x = pDstBox ? pDstBox->left : 0;
-            const uint32_t w = pDstBox ? (pDstBox->right - pDstBox->left) : mipW;
-            if (w == 0 || x + w > mipW) return;
-
-            ConvertedImage img = ConvertRowsIfNeeded(tex1->desc.Format, tex1->mtlFormat, w, 1, pSrcData, SrcRowPitch);
-            if (!img.data || img.totalBytes == 0) return;
-
-            id<MTLBuffer> stg = [mtlDevice newBufferWithBytes:img.data length:img.totalBytes options:MTLResourceStorageModeShared];
-            if (!stg) return;
-
-            EndRenderPass();
-            EnsureCommandBuffer();
-            hasEncodedCommands = true;
-            id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
-            [blit copyFromBuffer:stg
-                    sourceOffset:0
-               sourceBytesPerRow:img.rowBytes
-             sourceBytesPerImage:img.totalBytes
-                      sourceSize:MTLSizeMake(w, 1, 1)
-                       toTexture:tex1->mtlTexture
-                destinationSlice:0
-                destinationLevel:mip
-               destinationOrigin:MTLOriginMake(x, 0, 0)];
-            [blit endEncoding];
+                EndRenderPass();
+                EnsureCommandBuffer();
+                hasEncodedCommands = true;
+                id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
+                [blit copyFromBuffer:stg
+                        sourceOffset:0
+                   sourceBytesPerRow:img.rowBytes
+                 sourceBytesPerImage:img.totalBytes
+                          sourceSize:MTLSizeMake(w, 1, 1)
+                           toTexture:tex1->mtlTexture
+                    destinationSlice:0
+                    destinationLevel:mip
+                   destinationOrigin:MTLOriginMake(x, 0, 0)];
+                [blit endEncoding];
+            }
         }
     }
 
     void ClearRenderTargetView(ID3D11RenderTargetView* pRenderTargetView, const FLOAT ColorRGBA[4]) override {
         auto* rtv = static_cast<Cod3RenderTargetView*>(pRenderTargetView);
         if (!rtv || !rtv->texture || !rtv->texture->mtlTexture) return;
-        EndRenderPass();
-        EnsureCommandBuffer();
-        hasEncodedCommands = true;
-        MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = rtv->texture->mtlTexture;
-        rpd.colorAttachments[0].level = rtv->mipSlice;
-        rpd.colorAttachments[0].slice = rtv->firstArraySlice;
-        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-        rpd.colorAttachments[0].clearColor = MTLClearColorMake(ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]);
-        id<MTLRenderCommandEncoder> enc = [cmdBuffer renderCommandEncoderWithDescriptor:rpd];
-        [enc endEncoding];
+        @autoreleasepool {
+            EndRenderPass();
+            EnsureCommandBuffer();
+            hasEncodedCommands = true;
+            MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            rpd.colorAttachments[0].texture = rtv->texture->mtlTexture;
+            rpd.colorAttachments[0].level = rtv->mipSlice;
+            rpd.colorAttachments[0].slice = rtv->firstArraySlice;
+            rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rpd.colorAttachments[0].clearColor = MTLClearColorMake(ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]);
+            id<MTLRenderCommandEncoder> enc = [cmdBuffer renderCommandEncoderWithDescriptor:rpd];
+            [enc endEncoding];
+        }
     }
 
     void ClearView(ID3D11View* pView, const FLOAT Color[4], const D3D11_RECT* pRect, UINT NumRects) override {
@@ -2583,96 +2644,102 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
             return;
         }
 
-        const uint32_t sampleCount = std::max<uint32_t>(1u, rtv->texture->desc.SampleDesc.Count);
-        const uint32_t pipeKey = (uint32_t(rtv->texture->mtlFormat) << 8) | (sampleCount & 0xFFu);
-        id<MTLRenderPipelineState> pso = nil;
-        auto it = clearPipelines.find(pipeKey);
-        if (it != clearPipelines.end()) {
-            pso = it->second;
-        } else {
-            MTLRenderPipelineDescriptor* pdesc = [[MTLRenderPipelineDescriptor alloc] init];
-            pdesc.vertexFunction = clearVS;
-            pdesc.fragmentFunction = clearPS;
-            pdesc.rasterSampleCount = sampleCount;
-            pdesc.colorAttachments[0].pixelFormat = rtv->texture->mtlFormat;
-            pdesc.colorAttachments[0].blendingEnabled = NO;
-            pdesc.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
-            NSError* err = nil;
-            pso = [mtlDevice newRenderPipelineStateWithDescriptor:pdesc error:&err];
-            clearPipelines[pipeKey] = pso;
-        }
-        if (!pso) {
-            ClearRenderTargetView(rtv, Color);
-            return;
-        }
-
-        EndRenderPass();
-        EnsureCommandBuffer();
-        hasEncodedCommands = true;
-        MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = rtv->texture->mtlTexture;
-        rpd.colorAttachments[0].level = rtv->mipSlice;
-        rpd.colorAttachments[0].slice = rtv->firstArraySlice;
-        rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [cmdBuffer renderCommandEncoderWithDescriptor:rpd];
-        if (!enc) return;
-
-        [enc setRenderPipelineState:pso];
-        MTLViewport vp{ 0.0, 0.0, double(targetW), double(targetH), 0.0, 1.0 };
-        [enc setViewport:vp];
-        [enc setFragmentBytes:Color length:sizeof(FLOAT) * 4 atIndex:0];
-
-        for (UINT i = 0; i < NumRects; ++i) {
-            int32_t x0 = std::clamp<int32_t>(pRect[i].left, 0, int32_t(targetW));
-            int32_t y0 = std::clamp<int32_t>(pRect[i].top, 0, int32_t(targetH));
-            int32_t x1 = std::clamp<int32_t>(pRect[i].right, x0, int32_t(targetW));
-            int32_t y1 = std::clamp<int32_t>(pRect[i].bottom, y0, int32_t(targetH));
-            if (x1 > x0 && y1 > y0) {
-                MTLScissorRect sr{ NSUInteger(x0), NSUInteger(y0), NSUInteger(x1 - x0), NSUInteger(y1 - y0) };
-                [enc setScissorRect:sr];
-                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        @autoreleasepool {
+            const uint32_t sampleCount = std::max<uint32_t>(1u, rtv->texture->desc.SampleDesc.Count);
+            const uint32_t pipeKey = (uint32_t(rtv->texture->mtlFormat) << 8) | (sampleCount & 0xFFu);
+            id<MTLRenderPipelineState> pso = nil;
+            auto it = clearPipelines.find(pipeKey);
+            if (it != clearPipelines.end()) {
+                pso = it->second;
+            } else {
+                MTLRenderPipelineDescriptor* pdesc = [[MTLRenderPipelineDescriptor alloc] init];
+                pdesc.vertexFunction = clearVS;
+                pdesc.fragmentFunction = clearPS;
+                pdesc.rasterSampleCount = sampleCount;
+                pdesc.colorAttachments[0].pixelFormat = rtv->texture->mtlFormat;
+                pdesc.colorAttachments[0].blendingEnabled = NO;
+                pdesc.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
+                NSError* err = nil;
+                pso = [mtlDevice newRenderPipelineStateWithDescriptor:pdesc error:&err];
+                clearPipelines[pipeKey] = pso;
             }
+            if (!pso) {
+                ClearRenderTargetView(rtv, Color);
+                return;
+            }
+
+            EndRenderPass();
+            EnsureCommandBuffer();
+            hasEncodedCommands = true;
+            MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            rpd.colorAttachments[0].texture = rtv->texture->mtlTexture;
+            rpd.colorAttachments[0].level = rtv->mipSlice;
+            rpd.colorAttachments[0].slice = rtv->firstArraySlice;
+            rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> enc = [cmdBuffer renderCommandEncoderWithDescriptor:rpd];
+            if (!enc) return;
+
+            [enc setRenderPipelineState:pso];
+            MTLViewport vp{ 0.0, 0.0, double(targetW), double(targetH), 0.0, 1.0 };
+            [enc setViewport:vp];
+            [enc setFragmentBytes:Color length:sizeof(FLOAT) * 4 atIndex:0];
+
+            for (UINT i = 0; i < NumRects; ++i) {
+                int32_t x0 = std::clamp<int32_t>(pRect[i].left, 0, int32_t(targetW));
+                int32_t y0 = std::clamp<int32_t>(pRect[i].top, 0, int32_t(targetH));
+                int32_t x1 = std::clamp<int32_t>(pRect[i].right, x0, int32_t(targetW));
+                int32_t y1 = std::clamp<int32_t>(pRect[i].bottom, y0, int32_t(targetH));
+                if (x1 > x0 && y1 > y0) {
+                    MTLScissorRect sr{ NSUInteger(x0), NSUInteger(y0), NSUInteger(x1 - x0), NSUInteger(y1 - y0) };
+                    [enc setScissorRect:sr];
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                }
+            }
+            [enc endEncoding];
         }
-        [enc endEncoding];
     }
 
     void GenerateMips(ID3D11ShaderResourceView* pShaderResourceView) override {
         auto* srv = static_cast<Cod3ShaderResourceView*>(pShaderResourceView);
         if (!srv || !srv->mtlTexture || srv->mtlTexture.mipmapLevelCount <= 1) return;
-        EndRenderPass();
-        EnsureCommandBuffer();
-        hasEncodedCommands = true;
-        id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
-        [blit generateMipmapsForTexture:srv->mtlTexture];
-        [blit endEncoding];
+        @autoreleasepool {
+            EndRenderPass();
+            EnsureCommandBuffer();
+            hasEncodedCommands = true;
+            id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
+            [blit generateMipmapsForTexture:srv->mtlTexture];
+            [blit endEncoding];
+        }
     }
 
     void ClearDepthStencilView(ID3D11DepthStencilView* pDepthStencilView, UINT ClearFlags, FLOAT Depth, BYTE Stencil) override {
         auto* v = static_cast<Cod3DepthStencilView*>(pDepthStencilView);
         if (!v || !v->texture || !v->texture->mtlTexture) return;
-        EndRenderPass();
-        EnsureCommandBuffer();
-        hasEncodedCommands = true;
-        MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        if (ClearFlags & D3D11_CLEAR_DEPTH) {
-            rpd.depthAttachment.texture = v->texture->mtlTexture;
-            rpd.depthAttachment.level = v->mipSlice;
-            rpd.depthAttachment.slice = v->firstArraySlice;
-            rpd.depthAttachment.loadAction = MTLLoadActionClear;
-            rpd.depthAttachment.storeAction = MTLStoreActionStore;
-            rpd.depthAttachment.clearDepth = Depth;
+        @autoreleasepool {
+            EndRenderPass();
+            EnsureCommandBuffer();
+            hasEncodedCommands = true;
+            MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            if (ClearFlags & D3D11_CLEAR_DEPTH) {
+                rpd.depthAttachment.texture = v->texture->mtlTexture;
+                rpd.depthAttachment.level = v->mipSlice;
+                rpd.depthAttachment.slice = v->firstArraySlice;
+                rpd.depthAttachment.loadAction = MTLLoadActionClear;
+                rpd.depthAttachment.storeAction = MTLStoreActionStore;
+                rpd.depthAttachment.clearDepth = Depth;
+            }
+            if ((ClearFlags & D3D11_CLEAR_STENCIL) && v->texture->mtlFormat == MTLPixelFormatDepth32Float_Stencil8) {
+                rpd.stencilAttachment.texture = v->texture->mtlTexture;
+                rpd.stencilAttachment.level = v->mipSlice;
+                rpd.stencilAttachment.slice = v->firstArraySlice;
+                rpd.stencilAttachment.loadAction = MTLLoadActionClear;
+                rpd.stencilAttachment.storeAction = MTLStoreActionStore;
+                rpd.stencilAttachment.clearStencil = Stencil;
+            }
+            id<MTLRenderCommandEncoder> enc = [cmdBuffer renderCommandEncoderWithDescriptor:rpd];
+            [enc endEncoding];
         }
-        if ((ClearFlags & D3D11_CLEAR_STENCIL) && v->texture->mtlFormat == MTLPixelFormatDepth32Float_Stencil8) {
-            rpd.stencilAttachment.texture = v->texture->mtlTexture;
-            rpd.stencilAttachment.level = v->mipSlice;
-            rpd.stencilAttachment.slice = v->firstArraySlice;
-            rpd.stencilAttachment.loadAction = MTLLoadActionClear;
-            rpd.stencilAttachment.storeAction = MTLStoreActionStore;
-            rpd.stencilAttachment.clearStencil = Stencil;
-        }
-        id<MTLRenderCommandEncoder> enc = [cmdBuffer renderCommandEncoderWithDescriptor:rpd];
-        [enc endEncoding];
     }
 
     void CopySubresourceRegion(ID3D11Resource* pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, UINT, ID3D11Resource* pSrcResource, UINT SrcSubresource, const D3D11_BOX* pSrcBox) override {
@@ -2694,60 +2761,62 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
         auto* srcTex = dynamic_cast<Cod3Texture2D*>(pSrcResource);
         if (!dstTex || !srcTex || !srcTex->mtlTexture) return;
 
-        EndRenderPass();
-        EnsureCommandBuffer();
-        hasEncodedCommands = true;
+        @autoreleasepool {
+            EndRenderPass();
+            EnsureCommandBuffer();
+            hasEncodedCommands = true;
 
-        uint32_t srcMip = SrcSubresource % std::max<uint32_t>(1u, srcTex->desc.MipLevels);
-        uint32_t srcSlice = SrcSubresource / std::max<uint32_t>(1u, srcTex->desc.MipLevels);
-        uint32_t dstMip = DstSubresource % std::max<uint32_t>(1u, dstTex->desc.MipLevels);
-        uint32_t dstSlice = DstSubresource / std::max<uint32_t>(1u, dstTex->desc.MipLevels);
+            uint32_t srcMip = SrcSubresource % std::max<uint32_t>(1u, srcTex->desc.MipLevels);
+            uint32_t srcSlice = SrcSubresource / std::max<uint32_t>(1u, srcTex->desc.MipLevels);
+            uint32_t dstMip = DstSubresource % std::max<uint32_t>(1u, dstTex->desc.MipLevels);
+            uint32_t dstSlice = DstSubresource / std::max<uint32_t>(1u, dstTex->desc.MipLevels);
 
-        uint32_t srcX = pSrcBox ? pSrcBox->left : 0;
-        uint32_t srcY = pSrcBox ? pSrcBox->top : 0;
-        uint32_t w = pSrcBox ? (pSrcBox->right - pSrcBox->left) : std::max<uint32_t>(1u, srcTex->desc.Width >> srcMip);
-        uint32_t h = pSrcBox ? (pSrcBox->bottom - pSrcBox->top) : std::max<uint32_t>(1u, srcTex->desc.Height >> srcMip);
+            uint32_t srcX = pSrcBox ? pSrcBox->left : 0;
+            uint32_t srcY = pSrcBox ? pSrcBox->top : 0;
+            uint32_t w = pSrcBox ? (pSrcBox->right - pSrcBox->left) : std::max<uint32_t>(1u, srcTex->desc.Width >> srcMip);
+            uint32_t h = pSrcBox ? (pSrcBox->bottom - pSrcBox->top) : std::max<uint32_t>(1u, srcTex->desc.Height >> srcMip);
 
-        id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
-        if (dstTex->stagingBuffer) {
-            auto* sub = dstTex->Staging(DstSubresource);
-            if (sub) {
-                const bool isDepthStencil = (srcTex->mtlFormat == MTLPixelFormatDepth32Float_Stencil8);
-                const bool isDepth32 = (srcTex->mtlFormat == MTLPixelFormatDepth32Float);
-                uint32_t blockBytes = 0;
-                const bool compressed = IsBlockCompressed(dstTex->desc.Format, blockBytes);
-                const uint32_t copyBpp = (isDepthStencil || isDepth32) ? 4u : BytesPerPixel(dstTex->mtlFormat);
-                const size_t dstOffset = sub->offset +
-                    (compressed ? size_t(DstY / 4) * sub->rowPitch + size_t(DstX / 4) * blockBytes
-                                : size_t(DstY) * sub->rowPitch + size_t(DstX) * copyBpp);
-                const uint32_t copyRows = compressed ? std::max<uint32_t>(1u, (h + 3) / 4) : h;
-                const MTLBlitOption blitOpts = isDepthStencil ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone;
+            id<MTLBlitCommandEncoder> blit = [cmdBuffer blitCommandEncoder];
+            if (dstTex->stagingBuffer) {
+                auto* sub = dstTex->Staging(DstSubresource);
+                if (sub) {
+                    const bool isDepthStencil = (srcTex->mtlFormat == MTLPixelFormatDepth32Float_Stencil8);
+                    const bool isDepth32 = (srcTex->mtlFormat == MTLPixelFormatDepth32Float);
+                    uint32_t blockBytes = 0;
+                    const bool compressed = IsBlockCompressed(dstTex->desc.Format, blockBytes);
+                    const uint32_t copyBpp = (isDepthStencil || isDepth32) ? 4u : BytesPerPixel(dstTex->mtlFormat);
+                    const size_t dstOffset = sub->offset +
+                        (compressed ? size_t(DstY / 4) * sub->rowPitch + size_t(DstX / 4) * blockBytes
+                                    : size_t(DstY) * sub->rowPitch + size_t(DstX) * copyBpp);
+                    const uint32_t copyRows = compressed ? std::max<uint32_t>(1u, (h + 3) / 4) : h;
+                    const MTLBlitOption blitOpts = isDepthStencil ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone;
+                    [blit copyFromTexture:srcTex->mtlTexture
+                              sourceSlice:srcSlice
+                              sourceLevel:srcMip
+                             sourceOrigin:MTLOriginMake(srcX, srcY, 0)
+                               sourceSize:MTLSizeMake(w, h, 1)
+                                 toBuffer:dstTex->stagingBuffer
+                        destinationOffset:dstOffset
+                   destinationBytesPerRow:sub->rowPitch
+                 destinationBytesPerImage:size_t(sub->rowPitch) * copyRows
+                                  options:blitOpts];
+                    if (BytesPerPixel(dstTex->mtlFormat) == 8 && (isDepthStencil || isDepth32)) {
+                        sub->depthRepack = true;
+                    }
+                }
+            } else if (dstTex->mtlTexture) {
                 [blit copyFromTexture:srcTex->mtlTexture
                           sourceSlice:srcSlice
                           sourceLevel:srcMip
                          sourceOrigin:MTLOriginMake(srcX, srcY, 0)
                            sourceSize:MTLSizeMake(w, h, 1)
-                             toBuffer:dstTex->stagingBuffer
-                    destinationOffset:dstOffset
-               destinationBytesPerRow:sub->rowPitch
-             destinationBytesPerImage:size_t(sub->rowPitch) * copyRows
-                              options:blitOpts];
-                if (BytesPerPixel(dstTex->mtlFormat) == 8 && (isDepthStencil || isDepth32)) {
-                    sub->depthRepack = true;
-                }
+                            toTexture:dstTex->mtlTexture
+                     destinationSlice:dstSlice
+                     destinationLevel:dstMip
+                    destinationOrigin:MTLOriginMake(DstX, DstY, 0)];
             }
-        } else if (dstTex->mtlTexture) {
-            [blit copyFromTexture:srcTex->mtlTexture
-                      sourceSlice:srcSlice
-                      sourceLevel:srcMip
-                     sourceOrigin:MTLOriginMake(srcX, srcY, 0)
-                       sourceSize:MTLSizeMake(w, h, 1)
-                        toTexture:dstTex->mtlTexture
-                 destinationSlice:dstSlice
-                 destinationLevel:dstMip
-                destinationOrigin:MTLOriginMake(DstX, DstY, 0)];
+            [blit endEncoding];
         }
-        [blit endEncoding];
     }
 
     void CopyResource(ID3D11Resource* pDstResource, ID3D11Resource* pSrcResource) override {
@@ -2783,18 +2852,20 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
             return;
         }
 
-        EndRenderPass();
-        EnsureCommandBuffer();
-        hasEncodedCommands = true;
-        MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = srcTex->mtlTexture;
-        rpd.colorAttachments[0].resolveTexture = dstTex->mtlTexture;
-        rpd.colorAttachments[0].resolveLevel = DstSubresource % std::max<uint32_t>(1u, dstTex->desc.MipLevels);
-        rpd.colorAttachments[0].resolveSlice = DstSubresource / std::max<uint32_t>(1u, dstTex->desc.MipLevels);
-        rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
-        id<MTLRenderCommandEncoder> enc = [cmdBuffer renderCommandEncoderWithDescriptor:rpd];
-        [enc endEncoding];
+        @autoreleasepool {
+            EndRenderPass();
+            EnsureCommandBuffer();
+            hasEncodedCommands = true;
+            MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            rpd.colorAttachments[0].texture = srcTex->mtlTexture;
+            rpd.colorAttachments[0].resolveTexture = dstTex->mtlTexture;
+            rpd.colorAttachments[0].resolveLevel = DstSubresource % std::max<uint32_t>(1u, dstTex->desc.MipLevels);
+            rpd.colorAttachments[0].resolveSlice = DstSubresource / std::max<uint32_t>(1u, dstTex->desc.MipLevels);
+            rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+            id<MTLRenderCommandEncoder> enc = [cmdBuffer renderCommandEncoderWithDescriptor:rpd];
+            [enc endEncoding];
+        }
     }
 
     void Begin(ID3D11Asynchronous* pAsync) override {
@@ -2886,7 +2957,7 @@ struct Cod3DeviceContext final : public ID3D11DeviceContext1 {
     void PSGetShaderResources(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView** ppShaderResourceViews) override {
         if (!ppShaderResourceViews) return;
         for (UINT i = 0; i < NumViews; ++i) {
-            ID3D11ShaderResourceView* v = ((StartSlot + i) < 64) ? psSRVs[StartSlot + i] : nullptr;
+            ID3D11ShaderResourceView* v = ((StartSlot + i) < 128) ? psSRVs[StartSlot + i] : nullptr;
             if (v) v->AddRef();
             ppShaderResourceViews[i] = v;
         }
@@ -3008,7 +3079,13 @@ struct Cod3Adapter final : public IDXGIAdapter1 {
     IDXGIObject* parentFactory = nullptr;
     id<MTLDevice> mtlDevice = nil;
 
-    Cod3Adapter(IDXGIObject* factory, id<MTLDevice> dev) : parentFactory(factory), mtlDevice(dev) {}
+    Cod3Adapter(IDXGIObject* factory, id<MTLDevice> dev) : parentFactory(factory), mtlDevice(dev) {
+        if (parentFactory) parentFactory->AddRef();
+    }
+
+    ~Cod3Adapter() override {
+        if (parentFactory) parentFactory->Release();
+    }
 
     HRESULT QueryInterface(REFIID riid, void** ppvObject) override {
         return Cod3QI<Cod3Adapter, IDXGIObject, IDXGIAdapter, IDXGIAdapter1>(this, riid, ppvObject);
@@ -3433,16 +3510,12 @@ struct Cod3SwapChain final : public IDXGISwapChain2 {
 
 struct Cod3Factory final : public IDXGIFactory5 {
     id<MTLDevice> mtlDevice = nil;
-    Cod3Adapter* adapter = nullptr;
 
     Cod3Factory() {
         mtlDevice = MTLCreateSystemDefaultDevice();
-        adapter = new Cod3Adapter(this, mtlDevice);
     }
 
-    ~Cod3Factory() override {
-        if (adapter) adapter->Release();
-    }
+    ~Cod3Factory() override = default;
 
     HRESULT QueryInterface(REFIID riid, void** ppvObject) override {
         return Cod3QI<Cod3Factory, IDXGIObject, IDXGIFactory, IDXGIFactory1, IDXGIFactory2, IDXGIFactory5>(this, riid, ppvObject);
@@ -3451,16 +3524,14 @@ struct Cod3Factory final : public IDXGIFactory5 {
     HRESULT GetParent(REFIID, void**) override { return E_FAIL; }
 
     HRESULT EnumAdapters(UINT Adapter, IDXGIAdapter** ppAdapter) override {
-        if (Adapter > 0 || !ppAdapter || !adapter) return DXGI_ERROR_NOT_FOUND;
-        adapter->AddRef();
-        *ppAdapter = adapter;
+        if (Adapter > 0 || !ppAdapter || !mtlDevice) return DXGI_ERROR_NOT_FOUND;
+        *ppAdapter = new Cod3Adapter(this, mtlDevice);
         return S_OK;
     }
 
     HRESULT EnumAdapters1(UINT Adapter, IDXGIAdapter1** ppAdapter) override {
-        if (Adapter > 0 || !ppAdapter || !adapter) return DXGI_ERROR_NOT_FOUND;
-        adapter->AddRef();
-        *ppAdapter = adapter;
+        if (Adapter > 0 || !ppAdapter || !mtlDevice) return DXGI_ERROR_NOT_FOUND;
+        *ppAdapter = new Cod3Adapter(this, mtlDevice);
         return S_OK;
     }
 
