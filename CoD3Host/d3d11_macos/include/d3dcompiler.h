@@ -2,6 +2,8 @@
 
 #include "d3dcommon.h"
 
+#define COD3_D3DCOMPILE_BLOB_VERSION 3u
+
 #define D3DCOMPILER_DLL_A "d3dcompiler_47.dll"
 #define D3DCOMPILE_DEBUG                (1 << 0)
 #define D3DCOMPILE_SKIP_VALIDATION      (1 << 1)

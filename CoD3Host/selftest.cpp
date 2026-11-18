@@ -14,7 +14,16 @@
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
+
+#ifdef __APPLE__
+#include <SDL2/SDL.h>
+#include <mach-o/dyld.h>
+#include <spawn.h>
+#include <sys/wait.h>
+extern "C" char** environ;
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -780,54 +789,10 @@ namespace
         return 0;
     }
 
-    int RunRenderSelfTest()
+    std::vector<uint32_t> MakeSelftestVsWords()
     {
-        printf("=== Gate 5 Self-Test: Xenos->HLSL Translation, D3D11 Backend, Render Caches & Resolve ===\n");
-        fflush(stdout);
-
-        using Microsoft::WRL::ComPtr;
-
-        // Isolate shader disk cache and captured shader microcode in a temporary directory for this self-test.
-        const std::filesystem::path tempCacheRoot =
-            std::filesystem::temp_directory_path() / "cod3_gate5_shader_cache";
-        std::error_code ec;
-        const std::filesystem::path origCwd = std::filesystem::current_path(ec);
-        std::filesystem::remove_all(tempCacheRoot, ec);
-        std::filesystem::create_directories(tempCacheRoot, ec);
-        std::filesystem::current_path(tempCacheRoot, ec);
-        struct ScopedTempDirCleanup
-        {
-            std::filesystem::path origCwd;
-            std::filesystem::path tempRoot;
-            ~ScopedTempDirCleanup()
-            {
-                std::error_code cleanupEc;
-                if (!origCwd.empty())
-                    std::filesystem::current_path(origCwd, cleanupEc);
-                std::filesystem::remove_all(tempRoot, cleanupEc);
-            }
-        } tempDirGuard{ origCwd, tempCacheRoot };
-#ifndef _WIN32
-        setenv("LOCALAPPDATA", tempCacheRoot.string().c_str(), 1);
-        setenv("COD3_NOPRECOMPILE", "1", 1);
-        setenv("COD3_SCALE", "1", 1);
-#else
-        _putenv_s("LOCALAPPDATA", tempCacheRoot.string().c_str());
-        _putenv_s("COD3_NOPRECOMPILE", "1");
-        _putenv_s("COD3_SCALE", "1");
-#endif
-
-        // --------------------------------------------------------------------
-        // 1. Construct real Xenos vertex and pixel microcode programs,
-        //    translate via XenosHlsl::Translate, and compile via D3DCompile.
-        // --------------------------------------------------------------------
-        // Vertex microcode (4 slots = 12 dwords):
-        //   Slot 0 (CF): exece address=1, count=3, sequence=0b000001 (slot 1 is vfetch, slots 2-3 are ALU)
-        //   Slot 1 (vfetch): r[1].xyzw = vb0.Load4(r[0].x * 4), FMT_32_32_32_32_FLOAT (38), stride=4 dwords
-        //   Slot 2 (ALU):    oPos.xyzw = r[1].xyzw + c[0].xyzw
-        //   Slot 3 (ALU):    o0.xyzw   = c[1].xyzw + c[0].xyzw
         const uint64_t vsCf0 = (uint64_t(2) << 44) | (uint64_t(1) << 16) | (uint64_t(3) << 12) | 1ull;
-        const std::vector<uint32_t> vsWords = {
+        return {
             uint32_t(vsCf0 & 0xFFFFFFFFull),
             uint32_t((vsCf0 >> 32) & 0xFFFFull),
             0u,
@@ -844,12 +809,12 @@ namespace
             0u,
             (1u << 16) | (0u << 8)
         };
+    }
 
-        // Pixel microcode (2 slots = 6 dwords):
-        //   Slot 0 (CF): exece address=1, count=1, sequence=0 (slot 1 is ALU)
-        //   Slot 1 (ALU): oC0.xyzw = r[0].xyzw + c[0].xyzw
+    std::vector<uint32_t> MakeSelftestPsWords()
+    {
         const uint64_t psCf0 = (uint64_t(2) << 44) | (uint64_t(0) << 16) | (uint64_t(1) << 12) | 1ull;
-        const std::vector<uint32_t> psWords = {
+        return {
             uint32_t(psCf0 & 0xFFFFFFFFull),
             uint32_t((psCf0 >> 32) & 0xFFFFull),
             0u,
@@ -858,6 +823,148 @@ namespace
             0u,
             (0u << 16) | (0u << 8) | (1u << 31)
         };
+    }
+
+#ifdef __APPLE__
+    int SpawnSelfTestChild(const char* suiteArg)
+    {
+        char exePath[4096];
+        uint32_t size = sizeof(exePath);
+        if (_NSGetExecutablePath(exePath, &size) != 0)
+            return -1;
+        fflush(stdout);
+        fflush(stderr);
+        char* argv[] = { exePath, const_cast<char*>(suiteArg), nullptr };
+        pid_t pid = 0;
+        if (posix_spawn(&pid, exePath, nullptr, nullptr, argv, environ) != 0)
+            return -1;
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0)
+            return -1;
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+#endif
+
+    int RunRenderCacheSelfTest()
+    {
+        const char* expectedCompiledEnv = getenv("COD3_SELFTEST_CACHE_EXPECTED_COMPILED");
+        const uint64_t expectedCompiled = expectedCompiledEnv ? uint64_t(strtoull(expectedCompiledEnv, nullptr, 10)) : 0ull;
+        const uint64_t expectedFromDisk = (expectedCompiled <= 2) ? (2ull - expectedCompiled) : 0ull;
+
+        SELFTEST_CHECK(Guest::Initialize(nullptr), "render-cache: Guest::Initialize(nullptr) failed");
+        SELFTEST_CHECK(Guest::Base != nullptr, "render-cache: Guest::Base is null");
+        SELFTEST_CHECK(Render::Enabled(), "render-cache: Render::Enabled() failed");
+
+        const std::vector<uint32_t> vsWords = MakeSelftestVsWords();
+        const std::vector<uint32_t> psWords = MakeSelftestPsWords();
+
+        constexpr uint32_t VsGuestAddr = 0xA0110000u;
+        constexpr uint32_t PsGuestAddr = 0xA0111000u;
+        for (size_t i = 0; i < vsWords.size(); ++i)
+            Guest::Write32(Guest::Base, VsGuestAddr + uint32_t(i * 4), vsWords[i]);
+        for (size_t i = 0; i < psWords.size(); ++i)
+            Guest::Write32(Guest::Base, PsGuestAddr + uint32_t(i * 4), psWords[i]);
+
+        Render::ShaderLoaded(false, VsGuestAddr, uint32_t(vsWords.size()));
+        Render::ShaderLoaded(true,  PsGuestAddr, uint32_t(psWords.size()));
+
+        const RenderState::Handle vsHandle = RenderShaders::Current(false);
+        const RenderState::Handle psHandle = RenderShaders::Current(true);
+        SELFTEST_CHECK(vsHandle != 0 && psHandle != 0,
+            "render-cache: RenderShaders::Current returned invalid handle (vs=%u ps=%u)", vsHandle, psHandle);
+
+        const RenderShaders::Program* vsProg = RenderShaders::Get(vsHandle);
+        const RenderShaders::Program* psProg = RenderShaders::Get(psHandle);
+        SELFTEST_CHECK(vsProg != nullptr && psProg != nullptr, "render-cache: RenderShaders::Get returned null");
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const auto vsState = vsProg->state.load(std::memory_order_acquire);
+            const auto psState = psProg->state.load(std::memory_order_acquire);
+            if ((vsState == RenderShaders::State::Ready || vsState == RenderShaders::State::Failed) &&
+                (psState == RenderShaders::State::Ready || psState == RenderShaders::State::Failed))
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
+        SELFTEST_CHECK(vsProg->state.load(std::memory_order_acquire) == RenderShaders::State::Ready,
+            "render-cache: VS failed to reach Ready state");
+        SELFTEST_CHECK(psProg->state.load(std::memory_order_acquire) == RenderShaders::State::Ready,
+            "render-cache: PS failed to reach Ready state");
+        SELFTEST_CHECK(vsProg->shader != nullptr && psProg->shader != nullptr,
+            "render-cache: shader device objects are null");
+
+        const RenderShaders::Statistics stats = RenderShaders::Stats();
+        SELFTEST_CHECK(stats.fromDisk == expectedFromDisk && stats.compiled == expectedCompiled && stats.failed == 0,
+            "render-cache: unexpected shader stats (fromDisk=%llu expected=%llu, compiled=%llu expected=%llu, failed=%llu)",
+            (unsigned long long)stats.fromDisk, (unsigned long long)expectedFromDisk,
+            (unsigned long long)stats.compiled, (unsigned long long)expectedCompiled,
+            (unsigned long long)stats.failed);
+
+        Guest::Shutdown();
+        return 0;
+    }
+
+    int RunRenderSelfTest()
+    {
+#ifdef __APPLE__
+        // Step 0. Re-exec under MTL_DEBUG_LAYER=1 if not already set (and not opted out).
+        if (getenv("MTL_DEBUG_LAYER") == nullptr && getenv("COD3_SELFTEST_NO_REEXEC") == nullptr)
+        {
+            setenv("MTL_DEBUG_LAYER", "1", 1);
+            const int childRc = SpawnSelfTestChild("--self-test=render");
+            if (childRc < 0)
+            {
+                fprintf(stderr, "  [FAIL] Failed to re-exec under MTL_DEBUG_LAYER=1\n");
+                return 1;
+            }
+            return childRc;
+        }
+#endif
+
+        printf("=== Gate 5 Self-Test: Xenos->HLSL Translation, D3D11 Backend, Render Caches & Resolve ===\n");
+        fflush(stdout);
+
+        using Microsoft::WRL::ComPtr;
+
+        // Isolate shader disk cache and captured shader microcode in a temporary directory for this self-test.
+        const std::filesystem::path tempCacheRoot =
+            std::filesystem::temp_directory_path() / ("cod3_gate5_shader_cache_" + std::to_string(GetCurrentProcessId()));
+        const std::filesystem::path shaderCacheDir = tempCacheRoot / "shaders_cache";
+        std::error_code ec;
+        const std::filesystem::path origCwd = std::filesystem::current_path(ec);
+        std::filesystem::remove_all(tempCacheRoot, ec);
+        std::filesystem::create_directories(shaderCacheDir, ec);
+        std::filesystem::current_path(tempCacheRoot, ec);
+        struct ScopedTempDirCleanup
+        {
+            std::filesystem::path origCwd;
+            std::filesystem::path tempRoot;
+            ~ScopedTempDirCleanup()
+            {
+                std::error_code cleanupEc;
+                if (!origCwd.empty())
+                    std::filesystem::current_path(origCwd, cleanupEc);
+                std::filesystem::remove_all(tempRoot, cleanupEc);
+            }
+        } tempDirGuard{ origCwd, tempCacheRoot };
+#ifndef _WIN32
+        setenv("COD3_SHADER_CACHE_DIR", shaderCacheDir.string().c_str(), 1);
+        setenv("COD3_NOPRECOMPILE", "1", 1);
+        setenv("COD3_SCALE", "1", 1);
+#else
+        _putenv_s("LOCALAPPDATA", tempCacheRoot.string().c_str());
+        _putenv_s("COD3_NOPRECOMPILE", "1");
+        _putenv_s("COD3_SCALE", "1");
+#endif
+
+        // --------------------------------------------------------------------
+        // 1. Construct real Xenos vertex and pixel microcode programs,
+        //    translate via XenosHlsl::Translate, and compile via D3DCompile.
+        // --------------------------------------------------------------------
+        const std::vector<uint32_t> vsWords = MakeSelftestVsWords();
+        const std::vector<uint32_t> psWords = MakeSelftestPsWords();
 
         const XenosHlsl::Translation vsTrans = XenosHlsl::Translate(vsWords, false);
         SELFTEST_CHECK(vsTrans.ok, "Vertex microcode translation failed: %s", vsTrans.problem.c_str());
@@ -887,13 +994,49 @@ namespace
             "D3DCompile(ps_5_0) failed (hr=0x%08X): %s", unsigned(hr),
             psErr ? static_cast<const char*>(psErr->GetBufferPointer()) : "no error blob");
 
-        printf("  [PASS] 1. XenosHlsl::Translate & D3DCompile succeeded (VS=%zu bytes bytecode, PS=%zu bytes bytecode)\n",
-            vsBlob->GetBufferSize(), psBlob->GetBufferSize());
+#ifdef __APPLE__
+        {
+            struct Cd3mHeaderCheck
+            {
+                uint32_t magic;
+                uint32_t version;
+                uint32_t stage;
+                uint32_t flags;
+                uint32_t cbCount;
+            };
+            struct Cd3mCbCheck
+            {
+                uint16_t d3dSlot;
+                uint16_t mslSlot;
+                uint32_t declaredBytes;
+            };
+            SELFTEST_CHECK(vsBlob->GetBufferSize() >= sizeof(Cd3mHeaderCheck) + sizeof(Cd3mCbCheck),
+                "VS CD3M blob too small (%zu bytes)", vsBlob->GetBufferSize());
+            Cd3mHeaderCheck hdr{};
+            std::memcpy(&hdr, vsBlob->GetBufferPointer(), sizeof(hdr));
+            SELFTEST_CHECK(hdr.magic == 0x4D334443u && hdr.version == COD3_D3DCOMPILE_BLOB_VERSION && hdr.cbCount >= 1,
+                "Unexpected CD3M header (magic=0x%08X version=%u cbCount=%u)",
+                hdr.magic, hdr.version, hdr.cbCount);
+            bool found4096Cb = false;
+            const uint8_t* cbPtr = static_cast<const uint8_t*>(vsBlob->GetBufferPointer()) + 40; // sizeof(ShaderBlobHeader)
+            for (uint32_t i = 0; i < hdr.cbCount; ++i)
+            {
+                Cd3mCbCheck cb{};
+                std::memcpy(&cb, cbPtr + i * sizeof(Cd3mCbCheck), sizeof(cb));
+                if (cb.d3dSlot == 0 && cb.declaredBytes == 4096)
+                    found4096Cb = true;
+            }
+            SELFTEST_CHECK(found4096Cb, "Expected VS CB slot 0 declaredBytes == 4096 in CD3M v3 header");
+        }
+#endif
+
+        printf("  [PASS] 1. XenosHlsl::Translate & D3DCompile succeeded (VS=%zu bytes, PS=%zu bytes, CD3M v%u, VS CB0=4096 B)\n",
+            vsBlob->GetBufferSize(), psBlob->GetBufferSize(), unsigned(COD3_D3DCOMPILE_BLOB_VERSION));
 
         // --------------------------------------------------------------------
         // 2. Initialize Guest VM + Render backend, load shaders through
         //    Render::ShaderLoaded, wait for worker compilation, and verify
-        //    the on-disk shader cache round-trip.
+        //    the on-disk shader cache files were written.
         // --------------------------------------------------------------------
         SELFTEST_CHECK(Guest::Initialize(nullptr), "Guest::Initialize(nullptr) failed");
         SELFTEST_CHECK(Guest::Base != nullptr, "Guest::Base is null");
@@ -937,9 +1080,9 @@ namespace
         SELFTEST_CHECK(vsProg->shader != nullptr && psProg->shader != nullptr,
             "Compiled shader device objects are null");
 
-        // Verify disk cache files were written with 'C3SH' header and matching bytecode size.
-        const std::filesystem::path shaderCacheDir = tempCacheRoot / "CoD3Recomp" / "shaders";
+        // Verify disk cache files were written with 'C3SH' header.
         uint32_t cachedFilesFound = 0;
+        std::filesystem::path firstCacheFile;
         for (const auto& entry : std::filesystem::directory_iterator(shaderCacheDir, ec))
         {
             if (!entry.is_regular_file()) continue;
@@ -950,6 +1093,7 @@ namespace
             SELFTEST_CHECK(magic == 0x48533343u && version == 3u,
                 "Invalid shader cache header in %s (magic=0x%08X version=%u)",
                 entry.path().string().c_str(), magic, version);
+            if (firstCacheFile.empty()) firstCacheFile = entry.path();
             cachedFilesFound++;
         }
         SELFTEST_CHECK(cachedFilesFound == 2,
@@ -959,14 +1103,77 @@ namespace
         printf("  [PASS] 2. RenderShaders worker compiled VS (%016llx) & PS (%016llx) and wrote %u disk cache entries\n",
             (unsigned long long)vsProg->hash, (unsigned long long)psProg->hash, cachedFilesFound);
 
+#ifdef __APPLE__
         // --------------------------------------------------------------------
-        // 3. Execute a synthetic draw command (DI_PT_RECTLIST rectangle list
-        //    expansion + vertex buffer upload + constant ring + pipeline state)
-        //    followed by Render::Resolve (1x and 4x MSAA) and read back pixels.
+        // 3. Cache reload: spawn child `CoD3 --self-test=render-cache` against
+        //    the same cache directory and verify both programs load from disk.
         // --------------------------------------------------------------------
-        constexpr uint32_t VbPhysAddr      = 0x00200000u;
-        constexpr uint32_t ResolvePhys1x   = 0x00300000u;
-        constexpr uint32_t ResolvePhysMsaa = 0x00380000u;
+        setenv("COD3_SELFTEST_CACHE_EXPECTED_COMPILED", "0", 1);
+        const int reloadRc = SpawnSelfTestChild("--self-test=render-cache");
+        SELFTEST_CHECK(reloadRc == 0, "Child --self-test=render-cache failed (exit=%d)", reloadRc);
+        printf("  [PASS] 3. Shader disk cache round-trip reload verified in child process (fromDisk=2, compiled=0)\n");
+
+        // --------------------------------------------------------------------
+        // 4. Stale blob fallback: downgrade CD3M version in one cache file to 2,
+        //    spawn child again, verify it recompiles (compiled=1) and overwrites
+        //    the cache file back to v3.
+        // --------------------------------------------------------------------
+        {
+            std::vector<uint8_t> fileBytes;
+            {
+                std::ifstream in(firstCacheFile, std::ios::binary);
+                fileBytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            size_t cd3mOffset = std::string::npos;
+            const uint32_t cd3mMagic = 0x4D334443u;
+            for (size_t i = 0; i + 8 <= fileBytes.size(); ++i)
+            {
+                if (std::memcmp(fileBytes.data() + i, &cd3mMagic, 4) == 0)
+                {
+                    cd3mOffset = i;
+                    break;
+                }
+            }
+            SELFTEST_CHECK(cd3mOffset != std::string::npos,
+                "Could not locate CD3M magic in %s", firstCacheFile.string().c_str());
+            const uint32_t staleVersion = 2u;
+            std::memcpy(fileBytes.data() + cd3mOffset + 4, &staleVersion, 4);
+            {
+                std::ofstream out(firstCacheFile, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char*>(fileBytes.data()), std::streamsize(fileBytes.size()));
+            }
+
+            setenv("COD3_SELFTEST_CACHE_EXPECTED_COMPILED", "1", 1);
+            const int staleRc = SpawnSelfTestChild("--self-test=render-cache");
+            unsetenv("COD3_SELFTEST_CACHE_EXPECTED_COMPILED");
+            SELFTEST_CHECK(staleRc == 0, "Child --self-test=render-cache (stale blob) failed (exit=%d)", staleRc);
+
+            // Confirm the parent sees v3 restored in the overwritten cache file.
+            std::vector<uint8_t> updatedBytes;
+            {
+                std::ifstream in(firstCacheFile, std::ios::binary);
+                updatedBytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            SELFTEST_CHECK(cd3mOffset + 8 <= updatedBytes.size(), "Updated cache file unexpectedly truncated");
+            uint32_t restoredVersion = 0;
+            std::memcpy(&restoredVersion, updatedBytes.data() + cd3mOffset + 4, 4);
+            SELFTEST_CHECK(restoredVersion == COD3_D3DCOMPILE_BLOB_VERSION,
+                "Expected cache file CD3M version to be restored to %u, got %u",
+                unsigned(COD3_D3DCOMPILE_BLOB_VERSION), restoredVersion);
+            printf("  [PASS] 4. Stale CD3M v2 cache entry rejected, recompiled (compiled=1), and overwritten with v%u\n",
+                restoredVersion);
+        }
+#endif
+
+        // --------------------------------------------------------------------
+        // 5. Execute synthetic DI_PT_RECTLIST draws (non-indexed and indexed)
+        //    and 6. Render::Resolve (1x and 4x MSAA) with pixel readback.
+        // --------------------------------------------------------------------
+        constexpr uint32_t VbPhysAddr         = 0x00200000u;
+        constexpr uint32_t IbPhysAddr         = 0x00210000u;
+        constexpr uint32_t ResolvePhys1x      = 0x00300000u;
+        constexpr uint32_t ResolvePhysIndexed = 0x00340000u;
+        constexpr uint32_t ResolvePhysMsaa    = 0x00380000u;
 
         auto writeGuestFloat = [](uint32_t physAddr, float v) {
             uint32_t bits = 0;
@@ -974,7 +1181,7 @@ namespace
             Guest::Write32(Guest::Base, Guest::PhysicalAlias(physAddr), bits);
         };
 
-        // 3 vertices for a 64x64 screen-space rectangle list (4th vertex is synthesized by rect_main):
+        // 3 vertices for a 64x64 screen-space rectangle list (4th vertex is synthesized by main0_rect):
         //   v0 = (0,  0,  0.5, 1)
         //   v1 = (64, 0,  0.5, 1)
         //   v2 = (0,  64, 0.5, 1)
@@ -986,6 +1193,11 @@ namespace
         for (uint32_t v = 0; v < 3; ++v)
             for (uint32_t c = 0; c < 4; ++c)
                 writeGuestFloat(VbPhysAddr + (v * 4 + c) * 4, rectVerts[v][c]);
+
+        // 16-bit big-endian indices in guest memory for the indexed DI_PT_RECTLIST draw.
+        Guest::Write16(Guest::Base, Guest::PhysicalAlias(IbPhysAddr + 0), 0u);
+        Guest::Write16(Guest::Base, Guest::PhysicalAlias(IbPhysAddr + 2), 1u);
+        Guest::Write16(Guest::Base, Guest::PhysicalAlias(IbPhysAddr + 4), 2u);
 
         auto writeReg = [](uint32_t regIndex, uint32_t value) {
             Gpu::WriteRegister(Gpu::ApertureBase + regIndex * 4u, value);
@@ -1115,12 +1327,28 @@ namespace
             return ok;
         };
 
-        SELFTEST_CHECK(readbackAndVerify(ResolvePhys1x, 191, 128, 191, 255, "1x DI_PT_RECTLIST resolve"),
-            "1x rectangle-list draw + resolve pixel verification failed");
-        printf("  [PASS] 3. 1x DI_PT_RECTLIST draw (synthesizing 4th corner) + Render::Resolve verified RGBA=(191,128,191,255)\n");
+        SELFTEST_CHECK(readbackAndVerify(ResolvePhys1x, 191, 128, 191, 255, "1x non-indexed DI_PT_RECTLIST"),
+            "1x non-indexed rectangle-list draw + resolve pixel verification failed");
+
+        // Indexed DI_PT_RECTLIST draw: sourceSelect = 0 (DMA), 16-bit indices at IbPhysAddr.
+        // Change pixel constant c[0] to (0.0, 0.25, 0.25, 0.0) -> expected oC0 = (0.25, 0.75, 1.0, 1.0) -> RGBA (64, 191, 255, 255).
+        writeRegFloat(RenderState::PixelConstants + 0, 0.00f);
+        writeRegFloat(RenderState::PixelConstants + 1, 0.25f);
+        writeRegFloat(RenderState::PixelConstants + 2, 0.25f);
+        writeRegFloat(RenderState::PixelConstants + 3, 0.00f);
+
+        const uint32_t indexedRectInitiator = (3u << 16) | (0u << 6) | uint32_t(RenderState::Rectangles);
+        Render::Draw(indexedRectInitiator, IbPhysAddr, 3u);
+
+        writeReg(RenderState::CopyDestBase, ResolvePhysIndexed);
+        Render::Resolve();
+
+        SELFTEST_CHECK(readbackAndVerify(ResolvePhysIndexed, 64, 191, 255, 255, "1x indexed DI_PT_RECTLIST"),
+            "1x indexed rectangle-list draw + resolve pixel verification failed");
+        printf("  [PASS] 5. Non-indexed & indexed DI_PT_RECTLIST draws (synthesizing 4th corner) verified in both triangles\n");
 
         // --------------------------------------------------------------------
-        // 4. Test 4x MSAA render target draw + multisampled shader resolve.
+        // 6. Test 4x MSAA render target draw + multisampled shader resolve.
         // --------------------------------------------------------------------
         RenderResources::RequestMultisample(4);
         RenderResources::BeginFrame(2);
@@ -1145,9 +1373,493 @@ namespace
             msaaTarget ? msaaTarget->samples : 0u);
         SELFTEST_CHECK(readbackAndVerify(ResolvePhysMsaa, 64, 191, 191, 255, "4x MSAA resolve"),
             "4x MSAA draw + resolve pixel verification failed");
-        printf("  [PASS] 4. %ux MSAA render target draw + multisampled Render::Resolve verified RGBA=(64,191,191,255)\n",
-            msaaTarget->samples);
+        printf("  [PASS] 6. 1x & %ux MSAA Render::Resolve readback verified\n", msaaTarget->samples);
 
+        // --------------------------------------------------------------------
+        // 7. Shim parity unit tests on a fresh D3D11CreateDevice instance:
+        //    (a) CB window zero-padding past bound constant count
+        //    (b) Default rasterizer state (cull back)
+        //    (c) Empty scissor rect skips draw
+        //    (d) Pipeline cache UID when shader object is released and recreated
+        //    (e) UpdateSubresource on textures: command ordering & mip 1 slice
+        //    (f) QueryInterface returns E_NOINTERFACE for unknown IIDs
+        //    (g) TIMESTAMP / TIMESTAMP_DISJOINT queries around a draw
+        // --------------------------------------------------------------------
+        {
+            ComPtr<ID3D11Device> uDev;
+            ComPtr<ID3D11DeviceContext> uCtxBase;
+            D3D_FEATURE_LEVEL uFl = D3D_FEATURE_LEVEL_11_0;
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                D3D11_SDK_VERSION, &uDev, &uFl, &uCtxBase);
+            SELFTEST_CHECK(SUCCEEDED(hr) && uDev && uCtxBase, "Unit test D3D11CreateDevice failed");
+
+            ComPtr<ID3D11DeviceContext1> uCtx;
+            SELFTEST_CHECK(SUCCEEDED(uCtxBase.As(&uCtx)) && uCtx, "QueryInterface(ID3D11DeviceContext1) failed");
+
+            // (f) QueryInterface for unknown IID -> E_NOINTERFACE
+            {
+                const GUID unknownIid = { 0xDEADBEEFu, 0xCAFEu, 0xBABEu, { 1, 2, 3, 4, 5, 6, 7, 8 } };
+                void* out = reinterpret_cast<void*>(0x1);
+                SELFTEST_CHECK(uDev->QueryInterface(unknownIid, &out) == E_NOINTERFACE && out == nullptr,
+                    "Expected E_NOINTERFACE on device for unknown IID");
+                out = reinterpret_cast<void*>(0x1);
+                SELFTEST_CHECK(uCtx->QueryInterface(unknownIid, &out) == E_NOINTERFACE && out == nullptr,
+                    "Expected E_NOINTERFACE on context for unknown IID");
+                ComPtr<IUnknown> unk;
+                SELFTEST_CHECK(SUCCEEDED(uDev.As(&unk)) && unk, "Device QI(IUnknown) failed");
+                ComPtr<IDXGIDevice> dxgiDev;
+                SELFTEST_CHECK(SUCCEEDED(uDev.As(&dxgiDev)) && dxgiDev, "Device QI(IDXGIDevice) failed");
+            }
+
+            // Create 32x32 render target + RTV + staging texture
+            D3D11_TEXTURE2D_DESC rtDesc{};
+            rtDesc.Width = 32;
+            rtDesc.Height = 32;
+            rtDesc.MipLevels = 1;
+            rtDesc.ArraySize = 1;
+            rtDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            rtDesc.SampleDesc.Count = 1;
+            rtDesc.Usage = D3D11_USAGE_DEFAULT;
+            rtDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+            ComPtr<ID3D11Texture2D> uRt, uStg;
+            SELFTEST_CHECK(SUCCEEDED(uDev->CreateTexture2D(&rtDesc, nullptr, &uRt)) && uRt, "Unit CreateTexture2D(RT) failed");
+            ComPtr<ID3D11RenderTargetView> uRtv;
+            SELFTEST_CHECK(SUCCEEDED(uDev->CreateRenderTargetView(uRt.Get(), nullptr, &uRtv)) && uRtv, "Unit CreateRTV failed");
+
+            D3D11_TEXTURE2D_DESC stgDesc = rtDesc;
+            stgDesc.Usage = D3D11_USAGE_STAGING;
+            stgDesc.BindFlags = 0;
+            stgDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            SELFTEST_CHECK(SUCCEEDED(uDev->CreateTexture2D(&stgDesc, nullptr, &uStg)) && uStg, "Unit CreateTexture2D(STG) failed");
+
+            auto readPixel = [&](uint32_t x, uint32_t y, uint8_t outRgba[4]) -> bool {
+                uCtx->CopyResource(uStg.Get(), uRt.Get());
+                D3D11_MAPPED_SUBRESOURCE map{};
+                if (FAILED(uCtx->Map(uStg.Get(), 0, D3D11_MAP_READ, 0, &map)) || !map.pData)
+                    return false;
+                const uint8_t* p = static_cast<const uint8_t*>(map.pData) + y * map.RowPitch + x * 4;
+                std::memcpy(outRgba, p, 4);
+                uCtx->Unmap(uStg.Get(), 0);
+                return true;
+            };
+
+            auto compileShader = [&](const char* src, const char* target, ID3DBlob** blobOut) -> bool {
+                ComPtr<ID3DBlob> err;
+                HRESULT cHr = D3DCompile(src, std::strlen(src), "unit", nullptr, nullptr, "main", target,
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blobOut, &err);
+                if (FAILED(cHr))
+                {
+                    fprintf(stderr, "  [FAIL] Unit shader compile (%s) failed: %s\n",
+                        target, err ? static_cast<const char*>(err->GetBufferPointer()) : "unknown");
+                    return false;
+                }
+                return true;
+            };
+
+            // Full-screen CW triangle VS (front-facing under D3D11 default FrontCounterClockwise=FALSE)
+            const char* vsCwSrc =
+                "struct Out { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+                "Out main(uint id : SV_VertexID) {\n"
+                "    Out o;\n"
+                "    float2 uv = float2((id << 1) & 2, id & 2);\n"
+                "    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.5, 1.0);\n"
+                "    o.uv = uv;\n"
+                "    return o;\n"
+                "}\n";
+            // Full-screen CCW triangle VS (back-facing under D3D11 default FrontCounterClockwise=FALSE)
+            const char* vsCcwSrc =
+                "struct Out { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+                "Out main(uint id : SV_VertexID) {\n"
+                "    Out o;\n"
+                "    uint rev = (id == 1) ? 2 : ((id == 2) ? 1 : 0);\n"
+                "    float2 uv = float2((rev << 1) & 2, rev & 2);\n"
+                "    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.5, 1.0);\n"
+                "    o.uv = uv;\n"
+                "    return o;\n"
+                "}\n";
+
+            ComPtr<ID3DBlob> vsCwBlob, vsCcwBlob;
+            SELFTEST_CHECK(compileShader(vsCwSrc, "vs_5_0", &vsCwBlob), "vsCw compile failed");
+            SELFTEST_CHECK(compileShader(vsCcwSrc, "vs_5_0", &vsCcwBlob), "vsCcw compile failed");
+
+            ComPtr<ID3D11VertexShader> vsCw, vsCcw;
+            SELFTEST_CHECK(SUCCEEDED(uDev->CreateVertexShader(vsCwBlob->GetBufferPointer(), vsCwBlob->GetBufferSize(), nullptr, &vsCw)), "CreateVS(CW) failed");
+            SELFTEST_CHECK(SUCCEEDED(uDev->CreateVertexShader(vsCcwBlob->GetBufferPointer(), vsCcwBlob->GetBufferSize(), nullptr, &vsCcw)), "CreateVS(CCW) failed");
+
+            ID3D11RenderTargetView* rtvArr[1] = { uRtv.Get() };
+            uCtx->OMSetRenderTargets(1, rtvArr, nullptr);
+            D3D11_VIEWPORT vp{ 0.0f, 0.0f, 32.0f, 32.0f, 0.0f, 1.0f };
+            uCtx->RSSetViewports(1, &vp);
+            uCtx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+            // (a) PS reads cb0[20] with a 16-constant window -> 0
+            {
+                const char* psCbSrc =
+                    "cbuffer cb0 : register(b0) { float4 c[32]; };\n"
+                    "float4 main() : SV_Target0 { return c[20]; }\n";
+                ComPtr<ID3DBlob> psCbBlob;
+                SELFTEST_CHECK(compileShader(psCbSrc, "ps_5_0", &psCbBlob), "psCb compile failed");
+                ComPtr<ID3D11PixelShader> psCb;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreatePixelShader(psCbBlob->GetBufferPointer(), psCbBlob->GetBufferSize(), nullptr, &psCb)), "CreatePS(cb) failed");
+
+                std::vector<float> cbData(32 * 4, 1.0f);
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = 32 * 16;
+                bd.Usage = D3D11_USAGE_DEFAULT;
+                bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                D3D11_SUBRESOURCE_DATA init{ cbData.data(), 0, 0 };
+                ComPtr<ID3D11Buffer> cb;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateBuffer(&bd, &init, &cb)), "CreateBuffer(cb) failed");
+
+                const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+                uCtx->ClearRenderTargetView(uRtv.Get(), red);
+                uCtx->VSSetShader(vsCw.Get(), nullptr, 0);
+                uCtx->PSSetShader(psCb.Get(), nullptr, 0);
+                ID3D11Buffer* cbs[1] = { cb.Get() };
+                const UINT first = 0, count = 16;
+                uCtx->PSSetConstantBuffers1(0, 1, cbs, &first, &count);
+                uCtx->Draw(3, 0);
+
+                uint8_t px[4] = { 255, 255, 255, 255 };
+                SELFTEST_CHECK(readPixel(16, 16, px) && px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 0,
+                    "7(a) CB window past 16 constants read (%u,%u,%u,%u), expected (0,0,0,0)",
+                    px[0], px[1], px[2], px[3]);
+            }
+
+            // (b) Back-facing triangle with no RS state bound -> no pixels
+            {
+                const char* psWhiteSrc = "float4 main() : SV_Target0 { return float4(1, 1, 1, 1); }\n";
+                ComPtr<ID3DBlob> psWhiteBlob;
+                SELFTEST_CHECK(compileShader(psWhiteSrc, "ps_5_0", &psWhiteBlob), "psWhite compile failed");
+                ComPtr<ID3D11PixelShader> psWhite;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreatePixelShader(psWhiteBlob->GetBufferPointer(), psWhiteBlob->GetBufferSize(), nullptr, &psWhite)), "CreatePS(white) failed");
+
+                // First bind a CULL_NONE RS state and draw, then unbind RS (nullptr) to test default state restoration.
+                D3D11_RASTERIZER_DESC rsNoneDesc{};
+                rsNoneDesc.FillMode = D3D11_FILL_SOLID;
+                rsNoneDesc.CullMode = D3D11_CULL_NONE;
+                rsNoneDesc.DepthClipEnable = TRUE;
+                ComPtr<ID3D11RasterizerState> rsNone;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateRasterizerState(&rsNoneDesc, &rsNone)), "CreateRS(none) failed");
+
+                uCtx->RSSetState(rsNone.Get());
+                uCtx->VSSetShader(vsCcw.Get(), nullptr, 0);
+                uCtx->PSSetShader(psWhite.Get(), nullptr, 0);
+                uCtx->Draw(3, 0);
+
+                const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                uCtx->ClearRenderTargetView(uRtv.Get(), black);
+                uCtx->RSSetState(nullptr); // Default RS should cull back-facing CCW triangle
+                uCtx->Draw(3, 0);
+
+                uint8_t px[4] = { 255, 255, 255, 255 };
+                SELFTEST_CHECK(readPixel(16, 16, px) && px[0] == 0 && px[1] == 0 && px[2] == 0,
+                    "7(b) Back-facing triangle with nullptr RS drew (%u,%u,%u), expected (0,0,0)",
+                    px[0], px[1], px[2]);
+
+                // (c) RS with scissor on and an empty rect -> no pixels
+                D3D11_RASTERIZER_DESC rsScissorDesc = rsNoneDesc;
+                rsScissorDesc.ScissorEnable = TRUE;
+                ComPtr<ID3D11RasterizerState> rsScissor;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateRasterizerState(&rsScissorDesc, &rsScissor)), "CreateRS(scissor) failed");
+
+                uCtx->ClearRenderTargetView(uRtv.Get(), black);
+                uCtx->RSSetState(rsScissor.Get());
+                uCtx->VSSetShader(vsCw.Get(), nullptr, 0);
+                D3D11_RECT emptyRect{ 10, 10, 10, 10 };
+                uCtx->RSSetScissorRects(1, &emptyRect);
+                uCtx->Draw(3, 0);
+
+                SELFTEST_CHECK(readPixel(16, 16, px) && px[0] == 0 && px[1] == 0 && px[2] == 0,
+                    "7(c) Empty scissor rect drew (%u,%u,%u), expected (0,0,0)",
+                    px[0], px[1], px[2]);
+                uCtx->RSSetState(nullptr);
+            }
+
+            // (d) Draw with PS-A, release it, create PS-B, draw -> B's colour
+            {
+                const char* psASrc = "float4 main() : SV_Target0 { return float4(0, 1, 0, 1); }\n";
+                const char* psBSrc = "float4 main() : SV_Target0 { return float4(0, 0, 1, 1); }\n";
+                ComPtr<ID3DBlob> psABlob, psBBlob;
+                SELFTEST_CHECK(compileShader(psASrc, "ps_5_0", &psABlob), "psA compile failed");
+                SELFTEST_CHECK(compileShader(psBSrc, "ps_5_0", &psBBlob), "psB compile failed");
+
+                ID3D11PixelShader* psA = nullptr;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreatePixelShader(psABlob->GetBufferPointer(), psABlob->GetBufferSize(), nullptr, &psA)) && psA, "CreatePS(A) failed");
+                uCtx->VSSetShader(vsCw.Get(), nullptr, 0);
+                uCtx->PSSetShader(psA, nullptr, 0);
+                uCtx->Draw(3, 0);
+                uCtx->PSSetShader(nullptr, nullptr, 0);
+                psA->Release();
+
+                ComPtr<ID3D11PixelShader> psB;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreatePixelShader(psBBlob->GetBufferPointer(), psBBlob->GetBufferSize(), nullptr, &psB)) && psB, "CreatePS(B) failed");
+                uCtx->PSSetShader(psB.Get(), nullptr, 0);
+                uCtx->Draw(3, 0);
+
+                uint8_t px[4] = {};
+                SELFTEST_CHECK(readPixel(16, 16, px) && px[0] == 0 && px[1] == 0 && px[2] == 255,
+                    "7(d) Pipeline cache UID test got (%u,%u,%u), expected (0,0,255)",
+                    px[0], px[1], px[2]);
+            }
+
+            // (e) Draw sampling a texture, UpdateSubresource the texture, draw again in another region
+            //     -> first region old, second new; mip 1 update lands in mip 1
+            {
+                const char* psTexSrc =
+                    "Texture2D tex0 : register(t0);\n"
+                    "SamplerState smp0 : register(s0);\n"
+                    "struct In { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+                    "float4 main(In i) : SV_Target0 { return tex0.SampleLevel(smp0, float2(0.5, 0.5), 0); }\n";
+                ComPtr<ID3DBlob> psTexBlob;
+                SELFTEST_CHECK(compileShader(psTexSrc, "ps_5_0", &psTexBlob), "psTex compile failed");
+                ComPtr<ID3D11PixelShader> psTex;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreatePixelShader(psTexBlob->GetBufferPointer(), psTexBlob->GetBufferSize(), nullptr, &psTex)), "CreatePS(tex) failed");
+
+                std::vector<uint32_t> redMip0(32 * 32, 0xFF0000FFu);   // RGBA: (255, 0, 0, 255)
+                std::vector<uint32_t> redMip1(16 * 16, 0xFF0000FFu);
+                std::vector<uint32_t> greenMip0(32 * 32, 0xFF00FF00u); // RGBA: (0, 255, 0, 255)
+                std::vector<uint32_t> blueMip1(16 * 16, 0xFFFF0000u);  // RGBA: (0, 0, 255, 255)
+
+                D3D11_TEXTURE2D_DESC td{};
+                td.Width = 32;
+                td.Height = 32;
+                td.MipLevels = 2;
+                td.ArraySize = 1;
+                td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                td.SampleDesc.Count = 1;
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                D3D11_SUBRESOURCE_DATA initData[2] = {
+                    { redMip0.data(), 32 * 4, 0 },
+                    { redMip1.data(), 16 * 4, 0 }
+                };
+                ComPtr<ID3D11Texture2D> sampleTex;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateTexture2D(&td, initData, &sampleTex)), "CreateTexture2D(sampleTex) failed");
+                ComPtr<ID3D11ShaderResourceView> srvMip0;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateShaderResourceView(sampleTex.Get(), nullptr, &srvMip0)), "CreateSRV(sampleTex) failed");
+
+                const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                uCtx->ClearRenderTargetView(uRtv.Get(), black);
+                uCtx->VSSetShader(vsCw.Get(), nullptr, 0);
+                uCtx->PSSetShader(psTex.Get(), nullptr, 0);
+                ID3D11ShaderResourceView* srvs[1] = { srvMip0.Get() };
+                uCtx->PSSetShaderResources(0, 1, srvs);
+
+                // First draw in left half (0..16) -> should see red
+                D3D11_VIEWPORT leftVp{ 0.0f, 0.0f, 16.0f, 32.0f, 0.0f, 1.0f };
+                uCtx->RSSetViewports(1, &leftVp);
+                uCtx->Draw(3, 0);
+
+                // Update mip 0 to green mid-stream
+                uCtx->UpdateSubresource(sampleTex.Get(), 0, nullptr, greenMip0.data(), 32 * 4, 0);
+
+                // Second draw in right half (16..32) -> should see green
+                D3D11_VIEWPORT rightVp{ 16.0f, 0.0f, 16.0f, 32.0f, 0.0f, 1.0f };
+                uCtx->RSSetViewports(1, &rightVp);
+                uCtx->Draw(3, 0);
+
+                uint8_t pxLeft[4] = {}, pxRight[4] = {};
+                SELFTEST_CHECK(readPixel(8, 16, pxLeft) && pxLeft[0] == 255 && pxLeft[1] == 0 && pxLeft[2] == 0,
+                    "7(e) Pre-UpdateSubresource region got (%u,%u,%u), expected red (255,0,0)",
+                    pxLeft[0], pxLeft[1], pxLeft[2]);
+                SELFTEST_CHECK(readPixel(24, 16, pxRight) && pxRight[0] == 0 && pxRight[1] == 255 && pxRight[2] == 0,
+                    "7(e) Post-UpdateSubresource region got (%u,%u,%u), expected green (0,255,0)",
+                    pxRight[0], pxRight[1], pxRight[2]);
+
+                // Update mip 1 to blue and verify mip 1 is blue while mip 0 stays green
+                uCtx->UpdateSubresource(sampleTex.Get(), 1, nullptr, blueMip1.data(), 16 * 4, 0);
+                D3D11_TEXTURE2D_DESC stg2Desc = td;
+                stg2Desc.Usage = D3D11_USAGE_STAGING;
+                stg2Desc.BindFlags = 0;
+                stg2Desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                ComPtr<ID3D11Texture2D> stg2;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateTexture2D(&stg2Desc, nullptr, &stg2)), "CreateTexture2D(stg2) failed");
+                uCtx->CopyResource(stg2.Get(), sampleTex.Get());
+
+                D3D11_MAPPED_SUBRESOURCE mapMip0{}, mapMip1{};
+                SELFTEST_CHECK(SUCCEEDED(uCtx->Map(stg2.Get(), 0, D3D11_MAP_READ, 0, &mapMip0)) && mapMip0.pData, "Map(mip0) failed");
+                const uint8_t* m0 = static_cast<const uint8_t*>(mapMip0.pData);
+                SELFTEST_CHECK(m0[0] == 0 && m0[1] == 255 && m0[2] == 0, "7(e) Mip 0 overwritten by mip 1 update");
+                uCtx->Unmap(stg2.Get(), 0);
+
+                SELFTEST_CHECK(SUCCEEDED(uCtx->Map(stg2.Get(), 1, D3D11_MAP_READ, 0, &mapMip1)) && mapMip1.pData, "Map(mip1) failed");
+                const uint8_t* m1 = static_cast<const uint8_t*>(mapMip1.pData);
+                SELFTEST_CHECK(m1[0] == 0 && m1[1] == 0 && m1[2] == 255,
+                    "7(e) Mip 1 update got (%u,%u,%u), expected blue (0,0,255)", m1[0], m1[1], m1[2]);
+                uCtx->Unmap(stg2.Get(), 1);
+                uCtx->RSSetViewports(1, &vp);
+            }
+
+            // (g) TIMESTAMP begin/end around a draw -> GetData S_OK after flush, end >= begin
+            {
+                D3D11_QUERY_DESC qd{};
+                qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+                ComPtr<ID3D11Query> qDisjoint, qBegin, qEnd;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateQuery(&qd, &qDisjoint)) && qDisjoint, "CreateQuery(DISJOINT) failed");
+                qd.Query = D3D11_QUERY_TIMESTAMP;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateQuery(&qd, &qBegin)) && qBegin, "CreateQuery(TIMESTAMP begin) failed");
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateQuery(&qd, &qEnd)) && qEnd, "CreateQuery(TIMESTAMP end) failed");
+
+                uCtx->Begin(qDisjoint.Get());
+                uCtx->End(qBegin.Get());
+                uCtx->Draw(3, 0);
+                uCtx->End(qEnd.Get());
+                uCtx->End(qDisjoint.Get());
+                uCtx->Flush();
+
+                D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disj{};
+                UINT64 t0 = 0, t1 = 0;
+                const auto qDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                bool gotDisj = false, gotT0 = false, gotT1 = false;
+                while (std::chrono::steady_clock::now() < qDeadline)
+                {
+                    if (!gotDisj && uCtx->GetData(qDisjoint.Get(), &disj, sizeof(disj), 0) == S_OK) gotDisj = true;
+                    if (!gotT0 && uCtx->GetData(qBegin.Get(), &t0, sizeof(t0), 0) == S_OK) gotT0 = true;
+                    if (!gotT1 && uCtx->GetData(qEnd.Get(), &t1, sizeof(t1), 0) == S_OK) gotT1 = true;
+                    if (gotDisj && gotT0 && gotT1) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                SELFTEST_CHECK(gotDisj && gotT0 && gotT1, "7(g) Timed out waiting for TIMESTAMP query GetData");
+                SELFTEST_CHECK(!disj.Disjoint && disj.Frequency > 0 && t1 >= t0 && t1 > 0,
+                    "7(g) Invalid timestamp query values (disjoint=%d freq=%llu t0=%llu t1=%llu)",
+                    int(disj.Disjoint), (unsigned long long)disj.Frequency,
+                    (unsigned long long)t0, (unsigned long long)t1);
+            }
+
+            // Also verify depth readback (C-6: Depth32Float_Stencil8 -> R32G8X24 staging repack)
+            {
+                D3D11_TEXTURE2D_DESC dDesc = rtDesc;
+                dDesc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+                dDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+                ComPtr<ID3D11Texture2D> dTex, dStg;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateTexture2D(&dDesc, nullptr, &dTex)) && dTex, "CreateTexture2D(depth) failed");
+                D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+                dsvDesc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+                dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                ComPtr<ID3D11DepthStencilView> dsv;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateDepthStencilView(dTex.Get(), &dsvDesc, &dsv)) && dsv, "CreateDSV failed");
+                uCtx->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 0.25f, 0);
+
+                dDesc.Usage = D3D11_USAGE_STAGING;
+                dDesc.BindFlags = 0;
+                dDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                SELFTEST_CHECK(SUCCEEDED(uDev->CreateTexture2D(&dDesc, nullptr, &dStg)) && dStg, "CreateTexture2D(depth staging) failed");
+                uCtx->CopyResource(dStg.Get(), dTex.Get());
+                D3D11_MAPPED_SUBRESOURCE dMap{};
+                SELFTEST_CHECK(SUCCEEDED(uCtx->Map(dStg.Get(), 0, D3D11_MAP_READ, 0, &dMap)) && dMap.pData, "Map(depth staging) failed");
+                float z0 = 0.0f, zMid = 0.0f;
+                std::memcpy(&z0, static_cast<const uint8_t*>(dMap.pData), 4);
+                std::memcpy(&zMid, static_cast<const uint8_t*>(dMap.pData) + 16 * dMap.RowPitch + 16 * 8, 4);
+                uCtx->Unmap(dStg.Get(), 0);
+                SELFTEST_CHECK(std::fabs(z0 - 0.25f) < 1e-4f && std::fabs(zMid - 0.25f) < 1e-4f,
+                    "Depth staging readback got z0=%f zMid=%f, expected 0.25", z0, zMid);
+            }
+
+            printf("  [PASS] 7. Shim parity unit tests passed: (a) CB window 0-pad, (b) default RS cull, (c) empty scissor, (d) PSO UID, (e) UpdateSubresource ordering/mip, (f) QI E_NOINTERFACE, (g) GPU timestamps\n");
+
+#ifdef __APPLE__
+            // --------------------------------------------------------------------
+            // 8. Swap chain test on a hidden SDL_WINDOW_METAL window:
+            //    CreateSwapChainForHwnd 128x128, Present(1), Present(0),
+            //    ResizeBuffers(160, 120), Present(0); then Render::SetWindow +
+            //    Render::PresentIdle() creates the renderer's swap chain.
+            // --------------------------------------------------------------------
+            {
+                const bool allowNoWindow = getenv("COD3_SELFTEST_NO_WINDOW") != nullptr;
+                if (SDL_Init(SDL_INIT_VIDEO) != 0)
+                {
+                    if (allowNoWindow)
+                    {
+                        printf("  [SKIP] 8. Swap chain test: SKIPPED (SDL_Init failed: %s)\n", SDL_GetError());
+                    }
+                    else
+                    {
+                        SELFTEST_CHECK(false, "SDL_Init(SDL_INIT_VIDEO) failed: %s", SDL_GetError());
+                    }
+                }
+                else
+                {
+                    SDL_Window* win1 = SDL_CreateWindow("CoD3Gate5Swap1", 0, 0, 128, 128, SDL_WINDOW_HIDDEN | SDL_WINDOW_METAL);
+                    if (!win1 && allowNoWindow)
+                    {
+                        printf("  [SKIP] 8. Swap chain test: SKIPPED (SDL_CreateWindow failed: %s)\n", SDL_GetError());
+                        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+                    }
+                    else
+                    {
+                        SELFTEST_CHECK(win1 != nullptr, "SDL_CreateWindow(SDL_WINDOW_METAL) failed: %s", SDL_GetError());
+                        ComPtr<IDXGIDevice> dxgiDev;
+                        ComPtr<IDXGIAdapter> dxgiAdp;
+                        ComPtr<IDXGIFactory2> dxgiFac;
+                        SELFTEST_CHECK(SUCCEEDED(uDev.As(&dxgiDev)) && SUCCEEDED(dxgiDev->GetAdapter(&dxgiAdp)) &&
+                            SUCCEEDED(dxgiAdp->GetParent(IID_PPV_ARGS(&dxgiFac))) && dxgiFac,
+                            "DXGI factory hierarchy query failed");
+
+                        DXGI_SWAP_CHAIN_DESC1 scDesc{};
+                        scDesc.Width = 128;
+                        scDesc.Height = 128;
+                        scDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                        scDesc.SampleDesc.Count = 1;
+                        scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                        scDesc.BufferCount = 3;
+                        scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+                        ComPtr<IDXGISwapChain1> sc1;
+                        SELFTEST_CHECK(SUCCEEDED(dxgiFac->CreateSwapChainForHwnd(uDev.Get(), win1, &scDesc, nullptr, nullptr, &sc1)) && sc1,
+                            "CreateSwapChainForHwnd(128x128) failed");
+
+                        ComPtr<IDXGISwapChain2> sc2;
+                        SELFTEST_CHECK(SUCCEEDED(sc1.As(&sc2)) && SUCCEEDED(sc2->SetMaximumFrameLatency(2)),
+                            "IDXGISwapChain2::SetMaximumFrameLatency failed");
+
+                        {
+                            ComPtr<ID3D11Texture2D> bb;
+                            ComPtr<ID3D11RenderTargetView> bbRtv;
+                            SELFTEST_CHECK(SUCCEEDED(sc1->GetBuffer(0, IID_PPV_ARGS(&bb))) && bb, "SwapChain GetBuffer(0) failed");
+                            SELFTEST_CHECK(SUCCEEDED(uDev->CreateRenderTargetView(bb.Get(), nullptr, &bbRtv)) && bbRtv, "CreateRTV(backBuffer) failed");
+                            const float clr[4] = { 0.1f, 0.2f, 0.3f, 1.0f };
+                            uCtx->ClearRenderTargetView(bbRtv.Get(), clr);
+                            SELFTEST_CHECK(SUCCEEDED(sc1->Present(1, 0)), "SwapChain Present(1) failed");
+                            SELFTEST_CHECK(SUCCEEDED(sc1->Present(0, 0)), "SwapChain Present(0) failed");
+                        }
+
+                        uCtx->OMSetRenderTargets(0, nullptr, nullptr);
+                        SELFTEST_CHECK(SUCCEEDED(sc1->ResizeBuffers(0, 160, 120, DXGI_FORMAT_UNKNOWN, 0)),
+                            "SwapChain ResizeBuffers(160, 120) failed");
+                        {
+                            ComPtr<ID3D11Texture2D> bb;
+                            SELFTEST_CHECK(SUCCEEDED(sc1->GetBuffer(0, IID_PPV_ARGS(&bb))) && bb, "GetBuffer after ResizeBuffers failed");
+                            D3D11_TEXTURE2D_DESC bbDesc{};
+                            bb->GetDesc(&bbDesc);
+                            SELFTEST_CHECK(bbDesc.Width == 160 && bbDesc.Height == 120,
+                                "Expected resized backBuffer 160x120, got %ux%u", bbDesc.Width, bbDesc.Height);
+                            SELFTEST_CHECK(SUCCEEDED(sc1->Present(0, 0)), "SwapChain Present(0) after resize failed");
+                        }
+                        sc2.Reset();
+                        sc1.Reset();
+                        SDL_DestroyWindow(win1);
+
+                        // Also test the renderer's own swap chain path via Render::SetWindow + Render::PresentIdle()
+                        SDL_Window* win2 = SDL_CreateWindow("CoD3Gate5Swap2", 0, 0, 128, 128, SDL_WINDOW_HIDDEN | SDL_WINDOW_METAL);
+                        SELFTEST_CHECK(win2 != nullptr, "SDL_CreateWindow(win2) failed");
+                        Render::SetWindow(win2, 128, 128);
+                        Render::PresentIdle();
+                        Render::SetWindow(nullptr, 0, 0);
+                        SDL_DestroyWindow(win2);
+                        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+
+                        printf("  [PASS] 8. Swap chain creation, Present(1/0), ResizeBuffers(160x120), and Render::SetWindow + PresentIdle verified\n");
+                    }
+                }
+            }
+#endif
+        }
+
+        // --------------------------------------------------------------------
+        // 9. Cache statistics assertions.
+        // --------------------------------------------------------------------
         const RenderPipeline::Statistics pipeStats = RenderPipeline::Stats();
         const RenderResources::Statistics resStats = RenderResources::Stats();
         SELFTEST_CHECK(pipeStats.blendStates >= 1 && pipeStats.depthStates >= 1 && pipeStats.rasterizerStates >= 1,
@@ -1155,6 +1867,9 @@ namespace
             pipeStats.blendStates, pipeStats.depthStates, pipeStats.rasterizerStates);
         SELFTEST_CHECK(resStats.buffers >= 1 && resStats.colorTargets >= 1 && resStats.depthTargets >= 1 && resStats.resolved >= 2,
             "Expected resource caches to be populated (buffers=%u colorTargets=%u depthTargets=%u resolved=%u)",
+            resStats.buffers, resStats.colorTargets, resStats.depthTargets, resStats.resolved);
+        printf("  [PASS] 9. Pipeline and resource cache statistics verified (blend=%u depth=%u rast=%u buffers=%u colorTargets=%u depthTargets=%u resolved=%u)\n",
+            pipeStats.blendStates, pipeStats.depthStates, pipeStats.rasterizerStates,
             resStats.buffers, resStats.colorTargets, resStats.depthTargets, resStats.resolved);
 
         Guest::Shutdown();
@@ -1168,6 +1883,12 @@ namespace SelfTest
 {
     int Run(const std::string& suite)
     {
+        setvbuf(stdout, nullptr, _IONBF, 0);
+        setvbuf(stderr, nullptr, _IONBF, 0);
+        if (suite == "render-cache")
+        {
+            return RunRenderCacheSelfTest();
+        }
         if (suite == "vm" || suite == "all")
         {
             const int rc = RunVmSelfTest();

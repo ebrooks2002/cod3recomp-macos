@@ -136,15 +136,24 @@ typedef enum D3D11_CULL_MODE {
 } D3D11_CULL_MODE;
 
 typedef enum D3D11_FILTER {
-    D3D11_FILTER_MIN_MAG_MIP_POINT        = 0,
-    D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR = 0x1,
-    D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT = 0x4,
-    D3D11_FILTER_MIN_POINT_MAG_MIP_LINEAR = 0x5,
-    D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT = 0x10,
-    D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR = 0x11,
-    D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT = 0x14,
-    D3D11_FILTER_MIN_MAG_MIP_LINEAR       = 0x15,
-    D3D11_FILTER_ANISOTROPIC              = 0x55
+    D3D11_FILTER_MIN_MAG_MIP_POINT                          = 0,
+    D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR                   = 0x1,
+    D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT             = 0x4,
+    D3D11_FILTER_MIN_POINT_MAG_MIP_LINEAR                   = 0x5,
+    D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT                   = 0x10,
+    D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR            = 0x11,
+    D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT                   = 0x14,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR                         = 0x15,
+    D3D11_FILTER_ANISOTROPIC                                = 0x55,
+    D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT               = 0x80,
+    D3D11_FILTER_COMPARISON_MIN_MAG_POINT_MIP_LINEAR        = 0x81,
+    D3D11_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_POINT  = 0x84,
+    D3D11_FILTER_COMPARISON_MIN_POINT_MAG_MIP_LINEAR        = 0x85,
+    D3D11_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT        = 0x90,
+    D3D11_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR = 0x91,
+    D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT        = 0x94,
+    D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR              = 0x95,
+    D3D11_FILTER_COMPARISON_ANISOTROPIC                     = 0xd5
 } D3D11_FILTER;
 
 typedef enum D3D11_TEXTURE_ADDRESS_MODE {
@@ -349,16 +358,29 @@ typedef struct D3D11_TEX2D_RTV {
     UINT MipSlice;
 } D3D11_TEX2D_RTV;
 
+typedef struct D3D11_TEX2D_ARRAY_RTV {
+    UINT MipSlice;
+    UINT FirstArraySlice;
+    UINT ArraySize;
+} D3D11_TEX2D_ARRAY_RTV;
+
 typedef struct D3D11_TEX2DMS_RTV {
     UINT UnusedField_NothingToDefine;
 } D3D11_TEX2DMS_RTV;
+
+typedef struct D3D11_TEX2DMS_ARRAY_RTV {
+    UINT FirstArraySlice;
+    UINT ArraySize;
+} D3D11_TEX2DMS_ARRAY_RTV;
 
 typedef struct D3D11_RENDER_TARGET_VIEW_DESC {
     DXGI_FORMAT         Format;
     D3D11_RTV_DIMENSION ViewDimension;
     union {
-        D3D11_TEX2D_RTV   Texture2D;
-        D3D11_TEX2DMS_RTV Texture2DMS;
+        D3D11_TEX2D_RTV         Texture2D;
+        D3D11_TEX2D_ARRAY_RTV   Texture2DArray;
+        D3D11_TEX2DMS_RTV       Texture2DMS;
+        D3D11_TEX2DMS_ARRAY_RTV Texture2DMSArray;
     };
 } D3D11_RENDER_TARGET_VIEW_DESC;
 
@@ -366,17 +388,30 @@ typedef struct D3D11_TEX2D_DSV {
     UINT MipSlice;
 } D3D11_TEX2D_DSV;
 
+typedef struct D3D11_TEX2D_ARRAY_DSV {
+    UINT MipSlice;
+    UINT FirstArraySlice;
+    UINT ArraySize;
+} D3D11_TEX2D_ARRAY_DSV;
+
 typedef struct D3D11_TEX2DMS_DSV {
     UINT UnusedField_NothingToDefine;
 } D3D11_TEX2DMS_DSV;
+
+typedef struct D3D11_TEX2DMS_ARRAY_DSV {
+    UINT FirstArraySlice;
+    UINT ArraySize;
+} D3D11_TEX2DMS_ARRAY_DSV;
 
 typedef struct D3D11_DEPTH_STENCIL_VIEW_DESC {
     DXGI_FORMAT         Format;
     D3D11_DSV_DIMENSION ViewDimension;
     UINT                Flags;
     union {
-        D3D11_TEX2D_DSV   Texture2D;
-        D3D11_TEX2DMS_DSV Texture2DMS;
+        D3D11_TEX2D_DSV         Texture2D;
+        D3D11_TEX2D_ARRAY_DSV   Texture2DArray;
+        D3D11_TEX2DMS_DSV       Texture2DMS;
+        D3D11_TEX2DMS_ARRAY_DSV Texture2DMSArray;
     };
 } D3D11_DEPTH_STENCIL_VIEW_DESC;
 
@@ -590,10 +625,29 @@ struct ID3D11Device : public IUnknown {
     virtual void GetImmediateContext(ID3D11DeviceContext** ppImmediateContext) = 0;
 };
 
-template <> struct Cod3UuidTraits<ID3D11Device>        { static constexpr GUID guid = { 0x00000010, 0, 0, {0} }; };
-template <> struct Cod3UuidTraits<ID3D11DeviceContext> { static constexpr GUID guid = { 0x00000011, 0, 0, {0} }; };
-template <> struct Cod3UuidTraits<ID3D11Texture2D>     { static constexpr GUID guid = { 0x00000012, 0, 0, {0} }; };
-template <> struct Cod3UuidTraits<ID3D11InfoQueue>     { static constexpr GUID guid = { 0x00000014, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11Device>             { static constexpr GUID guid = { 0x00000010, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11DeviceContext>      { static constexpr GUID guid = { 0x00000011, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11Texture2D>          { static constexpr GUID guid = { 0x00000012, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11InfoQueue>          { static constexpr GUID guid = { 0x00000014, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11DeviceChild>        { static constexpr GUID guid = { 0x00000015, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11Asynchronous>       { static constexpr GUID guid = { 0x00000016, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11Query>              { static constexpr GUID guid = { 0x00000017, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11Resource>           { static constexpr GUID guid = { 0x00000018, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11Buffer>             { static constexpr GUID guid = { 0x00000019, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11Texture1D>          { static constexpr GUID guid = { 0x0000001A, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11Texture3D>          { static constexpr GUID guid = { 0x0000001B, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11View>               { static constexpr GUID guid = { 0x0000001C, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11ShaderResourceView> { static constexpr GUID guid = { 0x0000001D, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11RenderTargetView>   { static constexpr GUID guid = { 0x0000001E, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11DepthStencilView>   { static constexpr GUID guid = { 0x0000001F, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11VertexShader>       { static constexpr GUID guid = { 0x00000020, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11PixelShader>        { static constexpr GUID guid = { 0x00000021, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11GeometryShader>     { static constexpr GUID guid = { 0x00000022, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11InputLayout>        { static constexpr GUID guid = { 0x00000023, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11BlendState>         { static constexpr GUID guid = { 0x00000024, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11DepthStencilState>  { static constexpr GUID guid = { 0x00000025, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11RasterizerState>    { static constexpr GUID guid = { 0x00000026, 0, 0, {0} }; };
+template <> struct Cod3UuidTraits<ID3D11SamplerState>       { static constexpr GUID guid = { 0x00000027, 0, 0, {0} }; };
 
 extern "C" HRESULT WINAPI D3D11CreateDevice(
     IDXGIAdapter* pAdapter,

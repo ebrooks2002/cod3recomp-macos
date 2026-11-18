@@ -41,23 +41,16 @@ typedef void* HANDLE;
 #define FALSE 0
 #endif
 
+#ifndef COD3_PLATFORM_HRESULTS_DEFINED
+#define COD3_PLATFORM_HRESULTS_DEFINED
 #ifndef S_OK
-#define S_OK ((HRESULT)0L)
+inline constexpr HRESULT S_OK          = 0;
+inline constexpr HRESULT S_FALSE       = 1;
+inline constexpr HRESULT E_FAIL        = static_cast<HRESULT>(0x80004005u);
+inline constexpr HRESULT E_INVALIDARG  = static_cast<HRESULT>(0x80070057u);
+inline constexpr HRESULT E_OUTOFMEMORY = static_cast<HRESULT>(0x8007000Eu);
+inline constexpr HRESULT E_NOINTERFACE = static_cast<HRESULT>(0x80004002u);
 #endif
-#ifndef S_FALSE
-#define S_FALSE ((HRESULT)1L)
-#endif
-#ifndef E_FAIL
-#define E_FAIL ((HRESULT)0x80004005L)
-#endif
-#ifndef E_INVALIDARG
-#define E_INVALIDARG ((HRESULT)0x80070057L)
-#endif
-#ifndef E_OUTOFMEMORY
-#define E_OUTOFMEMORY ((HRESULT)0x8007000EL)
-#endif
-#ifndef E_NOINTERFACE
-#define E_NOINTERFACE ((HRESULT)0x80004002L)
 #endif
 #ifndef DXGI_ERROR_NOT_FOUND
 #define DXGI_ERROR_NOT_FOUND ((HRESULT)0x887A0002L)
@@ -133,15 +126,28 @@ inline const GUID& Cod3IidFromPpType(T**) {
 #define IID_PPV_ARGS(ppType) Cod3IidFromPpType(static_cast<decltype(ppType)>(nullptr)), Cod3IidPpvArgsHelper(ppType)
 #endif
 
+struct IUnknown;
+
+template <> struct Cod3UuidTraits<IUnknown> {
+    static constexpr GUID guid = { 0x00000000, 0x0000, 0x0000, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+};
+
+template <typename Self, typename... Ifaces>
+inline HRESULT Cod3QI(Self* self, REFIID riid, void** out) {
+    if (!out) return E_INVALIDARG;
+    *out = nullptr;
+    const bool hit = (riid == __uuidof(IUnknown)) || ((riid == __uuidof(Ifaces)) || ...);
+    if (!hit) return E_NOINTERFACE;
+    self->AddRef();
+    *out = self;
+    return S_OK;
+}
+
 struct IUnknown {
     std::atomic<uint32_t> m_refCount{ 1 };
     virtual ~IUnknown() = default;
     virtual HRESULT QueryInterface(REFIID riid, void** ppvObject) {
-        (void)riid;
-        if (!ppvObject) return E_INVALIDARG;
-        AddRef();
-        *ppvObject = this;
-        return S_OK;
+        return Cod3QI<IUnknown>(this, riid, ppvObject);
     }
     virtual uint32_t AddRef() {
         return ++m_refCount;
@@ -158,6 +164,10 @@ struct ID3D10Blob : public IUnknown {
     virtual SIZE_T GetBufferSize() = 0;
 };
 typedef ID3D10Blob ID3DBlob;
+
+template <> struct Cod3UuidTraits<ID3D10Blob> {
+    static constexpr GUID guid = { 0x8BA5FB08, 0x5195, 0x40E2, { 0xAC, 0x58, 0x0D, 0x98, 0x9C, 0x3A, 0x01, 0x02 } };
+};
 
 typedef enum D3D_DRIVER_TYPE {
     D3D_DRIVER_TYPE_UNKNOWN   = 0,

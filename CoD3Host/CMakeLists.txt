@@ -93,8 +93,7 @@ elseif (APPLE)
     set_source_files_properties("d3d11_macos/d3d11_macos.mm"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_include_directories(CoD3 PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/d3d11_macos/include"
-        "/opt/homebrew/include")
+        "${CMAKE_CURRENT_SOURCE_DIR}/d3d11_macos/include")
 endif()
 
 # A console application: setup is interactive and the import trap has to be
@@ -117,19 +116,20 @@ if (WIN32)
         windowscodecs   # screenshots as PNG
         shell32)
 elseif (APPLE)
-    target_link_directories(CoD3 PRIVATE
-        "/opt/homebrew/lib"
-        "/opt/homebrew/opt/glslang/lib"
-        "/opt/homebrew/opt/spirv-cross/lib")
+    find_package(glslang CONFIG REQUIRED)
+    find_package(spirv_cross_core CONFIG REQUIRED)
+    find_package(spirv_cross_glsl CONFIG REQUIRED)
+    find_package(spirv_cross_msl CONFIG REQUIRED)
+    find_package(SDL2 CONFIG REQUIRED)
     target_link_libraries(CoD3 PRIVATE
         "-framework Foundation"
         "-framework AppKit"
         "-framework Metal"
         "-framework QuartzCore"
-        SDL2
-        glslang
-        SPIRV
-        glslang-default-resource-limits
+        SDL2::SDL2
+        glslang::glslang
+        glslang::SPIRV
+        glslang::glslang-default-resource-limits
         spirv-cross-msl
         spirv-cross-glsl
         spirv-cross-core)

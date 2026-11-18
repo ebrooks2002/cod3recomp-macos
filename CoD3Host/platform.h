@@ -113,8 +113,17 @@ inline constexpr DWORD ERROR_SUCCESS        = 0u;
 inline constexpr DWORD ERROR_FILE_NOT_FOUND = 2u;
 inline constexpr DWORD ERROR_ACCESS_DENIED  = 5u;
 
-inline constexpr HRESULT S_OK   = 0;
-inline constexpr HRESULT E_FAIL = static_cast<HRESULT>(0x80004005u);
+#ifndef COD3_PLATFORM_HRESULTS_DEFINED
+#define COD3_PLATFORM_HRESULTS_DEFINED
+#ifndef S_OK
+inline constexpr HRESULT S_OK          = 0;
+inline constexpr HRESULT S_FALSE       = 1;
+inline constexpr HRESULT E_FAIL        = static_cast<HRESULT>(0x80004005u);
+inline constexpr HRESULT E_INVALIDARG  = static_cast<HRESULT>(0x80070057u);
+inline constexpr HRESULT E_OUTOFMEMORY = static_cast<HRESULT>(0x8007000Eu);
+inline constexpr HRESULT E_NOINTERFACE = static_cast<HRESULT>(0x80004002u);
+#endif
+#endif
 
 #ifndef SUCCEEDED
 #define SUCCEEDED(hr) (static_cast<HRESULT>(hr) >= 0)

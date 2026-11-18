@@ -241,9 +241,16 @@ namespace
         const char* what = program.pixel ? "pixel program" : "vertex program";
         if (ReadCache(program))
         {
-            RenderStats::NoteProgram(true);
-            program.state.store(MakeShaderObject(program) ? State::Ready : State::Failed, std::memory_order_release);
-            return;
+            if (MakeShaderObject(program))
+            {
+                RenderStats::NoteProgram(true);
+                program.state.store(State::Ready, std::memory_order_release);
+                return;
+            }
+            g_fromDisk.fetch_sub(1, std::memory_order_relaxed);
+            printf("render: cached %s %016llx was rejected; compiling it again\n", what, (unsigned long long)program.hash);
+            std::remove(CachePath(program.hash, program.pixel).c_str());
+            program.bytecode.clear();
         }
 
         program.state.store(State::Translating, std::memory_order_relaxed);
@@ -397,6 +404,9 @@ void RenderShaders::Initialize(ID3D11Device* device)
     g_keys.assign(1024, 0);
     g_handles.assign(1024, 0);
     g_translatorVersion = XenosHlsl::Version();
+#ifdef __APPLE__
+    g_translatorVersion ^= uint64_t(COD3_D3DCOMPILE_BLOB_VERSION) << 56;
+#endif
 
 #ifdef _WIN32
     HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
@@ -418,9 +428,9 @@ void RenderShaders::Initialize(ID3D11Device* device)
             g_cacheDirectory = directory;
         }
 #else
-        if (const char* local = getenv("LOCALAPPDATA"))
+        if (const char* overrideDir = getenv("COD3_SHADER_CACHE_DIR"))
         {
-            std::filesystem::path dir = std::filesystem::path(local) / "CoD3Recomp" / "shaders";
+            std::filesystem::path dir(overrideDir);
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             g_cacheDirectory = dir.string();

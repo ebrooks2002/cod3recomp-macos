@@ -1146,7 +1146,9 @@ namespace
         Timed timed(RenderStats::Frame().presentNanoseconds);
         if (!SwapChainReady() || !BuiltInPrograms())
         {
+#ifdef __APPLE__
             if (g_context) g_context->Flush();
+#endif
             return;
         }
         const int clientWidth = g_swapChainWidth, clientHeight = g_swapChainHeight;
