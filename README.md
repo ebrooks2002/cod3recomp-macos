@@ -118,7 +118,7 @@ PowerPC instruction tests, and all 16 that have a test pass.
 
 ### macOS (Apple Silicon ARM64)
 
-Requires Xcode Command Line Tools (`AppleClang`), CMake 3.20+, Ninja, and Python 3 (`brew install cmake ninja`).
+Requires Xcode Command Line Tools (`AppleClang`), CMake 3.20+, Ninja, Python 3, `glslang`, `spirv-cross`, and `sdl2` (`brew install cmake ninja glslang spirv-cross sdl2`).
 
 1. Initialize submodules and apply the `XenonRecomp` patch:
    ```bash
@@ -144,6 +144,7 @@ Requires Xcode Command Line Tools (`AppleClang`), CMake 3.20+, Ninja, and Python
 ```bash
 ./scripts/verify.sh          # the instructions this project added
 ./scripts/verify.sh --all    # every test Xenia has that PpcAsm encodes cleanly
+./build/CoD3Host/CoD3 --self-test=render   # Gate 5: shader translation, cache, D3D11->Metal parity, swap chain
 ```
 
 Assembles Xenia's instruction tests, recompiles them the same way the game's

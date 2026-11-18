@@ -56,6 +56,8 @@
 #define APIENTRY
 #endif
 
+#ifndef COD3_WIN32_TYPES_DEFINED
+#define COD3_WIN32_TYPES_DEFINED
 using BYTE      = uint8_t;
 using WORD      = uint16_t;
 using DWORD     = uint32_t;
@@ -65,8 +67,14 @@ using LONGLONG  = int64_t;
 using LONG      = int32_t;
 using ULONG     = uint32_t;
 using INT       = int32_t;
+using UINT8     = uint8_t;
+using UINT16    = uint16_t;
+using UINT32    = uint32_t;
 using UINT      = uint32_t;
+using UINT64    = uint64_t;
 using BOOL      = bool;
+using FLOAT     = float;
+using WCHAR     = wchar_t;
 using BOOLEAN   = uint8_t;
 using SIZE_T    = size_t;
 using ULONG_PTR = uintptr_t;
@@ -86,6 +94,7 @@ using PWSTR     = wchar_t*;
 using WPARAM    = uintptr_t;
 using LPARAM    = intptr_t;
 using LRESULT   = intptr_t;
+#endif
 
 #ifndef TRUE
 #define TRUE 1
@@ -104,8 +113,17 @@ inline constexpr DWORD ERROR_SUCCESS        = 0u;
 inline constexpr DWORD ERROR_FILE_NOT_FOUND = 2u;
 inline constexpr DWORD ERROR_ACCESS_DENIED  = 5u;
 
-inline constexpr HRESULT S_OK   = 0;
-inline constexpr HRESULT E_FAIL = static_cast<HRESULT>(0x80004005u);
+#ifndef COD3_PLATFORM_HRESULTS_DEFINED
+#define COD3_PLATFORM_HRESULTS_DEFINED
+#ifndef S_OK
+inline constexpr HRESULT S_OK          = 0;
+inline constexpr HRESULT S_FALSE       = 1;
+inline constexpr HRESULT E_FAIL        = static_cast<HRESULT>(0x80004005u);
+inline constexpr HRESULT E_INVALIDARG  = static_cast<HRESULT>(0x80070057u);
+inline constexpr HRESULT E_OUTOFMEMORY = static_cast<HRESULT>(0x8007000Eu);
+inline constexpr HRESULT E_NOINTERFACE = static_cast<HRESULT>(0x80004002u);
+#endif
+#endif
 
 #ifndef SUCCEEDED
 #define SUCCEEDED(hr) (static_cast<HRESULT>(hr) >= 0)
@@ -318,6 +336,8 @@ struct POINT
     LONG y;
 };
 
+#ifndef COD3_RECT_DEFINED
+#define COD3_RECT_DEFINED
 struct RECT
 {
     LONG left;
@@ -325,6 +345,58 @@ struct RECT
     LONG right;
     LONG bottom;
 };
+#endif
+
+#ifndef BI_RGB
+#define BI_RGB 0u
+#endif
+
+#pragma pack(push, 1)
+struct BITMAPFILEHEADER
+{
+    WORD  bfType;
+    DWORD bfSize;
+    WORD  bfReserved1;
+    WORD  bfReserved2;
+    DWORD bfOffBits;
+};
+
+struct BITMAPINFOHEADER
+{
+    DWORD biSize;
+    LONG  biWidth;
+    LONG  biHeight;
+    WORD  biPlanes;
+    WORD  biBitCount;
+    DWORD biCompression;
+    DWORD biSizeImage;
+    LONG  biXPelsPerMeter;
+    LONG  biYPelsPerMeter;
+    DWORD biClrUsed;
+    DWORD biClrImportant;
+};
+#pragma pack(pop)
+
+inline uint16_t _byteswap_ushort(uint16_t v)
+{
+    return __builtin_bswap16(v);
+}
+
+inline uint32_t _byteswap_ulong(uint32_t v)
+{
+    return __builtin_bswap32(v);
+}
+
+inline uint64_t _byteswap_uint64(uint64_t v)
+{
+    return __builtin_bswap64(v);
+}
+
+inline BOOL CreateDirectoryA(LPCSTR lpPathName, void*)
+{
+    if (!lpPathName) return FALSE;
+    return (mkdir(lpPathName, 0755) == 0 || errno == EEXIST) ? TRUE : FALSE;
+}
 
 struct MEMORY_BASIC_INFORMATION
 {

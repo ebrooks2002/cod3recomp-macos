@@ -12,7 +12,7 @@
 #include <string>
 #include <thread>
 
-#include <Windows.h>
+#include "platform.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 
@@ -116,8 +116,13 @@ namespace
     std::string CachePath(uint64_t hash, bool pixel)
     {
         char name[96];
+#ifdef _WIN32
         snprintf(name, sizeof(name), "\\%016llx.%s.%08llx.bin", (unsigned long long)hash, pixel ? "ps" : "vs",
             (unsigned long long)(g_translatorVersion & 0xFFFFFFFFull));
+#else
+        snprintf(name, sizeof(name), "/%016llx.%s.%08llx.bin", (unsigned long long)hash, pixel ? "ps" : "vs",
+            (unsigned long long)(g_translatorVersion & 0xFFFFFFFFull));
+#endif
         return g_cacheDirectory + name;
     }
 
@@ -236,9 +241,16 @@ namespace
         const char* what = program.pixel ? "pixel program" : "vertex program";
         if (ReadCache(program))
         {
-            RenderStats::NoteProgram(true);
-            program.state.store(MakeShaderObject(program) ? State::Ready : State::Failed, std::memory_order_release);
-            return;
+            if (MakeShaderObject(program))
+            {
+                RenderStats::NoteProgram(true);
+                program.state.store(State::Ready, std::memory_order_release);
+                return;
+            }
+            g_fromDisk.fetch_sub(1, std::memory_order_relaxed);
+            printf("render: cached %s %016llx was rejected; compiling it again\n", what, (unsigned long long)program.hash);
+            std::remove(CachePath(program.hash, program.pixel).c_str());
+            program.bytecode.clear();
         }
 
         program.state.store(State::Translating, std::memory_order_relaxed);
@@ -392,13 +404,21 @@ void RenderShaders::Initialize(ID3D11Device* device)
     g_keys.assign(1024, 0);
     g_handles.assign(1024, 0);
     g_translatorVersion = XenosHlsl::Version();
+#ifdef __APPLE__
+    g_translatorVersion ^= uint64_t(COD3_D3DCOMPILE_BLOB_VERSION) << 56;
+#endif
 
+#ifdef _WIN32
     HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
     if (compiler != nullptr) g_compile = reinterpret_cast<CompileFunction>(GetProcAddress(compiler, "D3DCompile"));
     if (g_compile == nullptr) printf("render: d3dcompiler_47.dll is not available; only cached programs can run\n");
+#else
+    g_compile = &D3DCompile;
+#endif
 
     if (getenv("COD3_NOSHADERCACHE") == nullptr)
     {
+#ifdef _WIN32
         if (const char* local = getenv("LOCALAPPDATA"))
         {
             std::string directory = std::string(local) + "\\CoD3Recomp";
@@ -407,6 +427,22 @@ void RenderShaders::Initialize(ID3D11Device* device)
             CreateDirectoryA(directory.c_str(), nullptr);
             g_cacheDirectory = directory;
         }
+#else
+        if (const char* overrideDir = getenv("COD3_SHADER_CACHE_DIR"))
+        {
+            std::filesystem::path dir(overrideDir);
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            g_cacheDirectory = dir.string();
+        }
+        else if (const char* home = getenv("HOME"))
+        {
+            std::filesystem::path dir = std::filesystem::path(home) / "Library" / "Caches" / "CoD3Recomp" / "shaders";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            g_cacheDirectory = dir.string();
+        }
+#endif
     }
     g_captureDirectory = std::filesystem::current_path() / "shaders";
 }

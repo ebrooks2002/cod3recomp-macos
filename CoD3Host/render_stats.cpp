@@ -10,8 +10,8 @@
 #include <mutex>
 #include <vector>
 
+#include "platform.h"
 #include <d3d11_1.h>
-#include <intrin.h>
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
