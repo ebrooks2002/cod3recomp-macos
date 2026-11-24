@@ -7,7 +7,12 @@
 #include <mutex>
 #include <string>
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include "platform.h"
+#include <dlfcn.h>
+#endif
 
 #ifdef COD3_HAVE_FFMPEG_HEADERS
 extern "C"
@@ -46,6 +51,7 @@ namespace
         std::string problem;
     };
 
+#ifdef _WIN32
     HMODULE LoadFrom(const wchar_t* name)
     {
         // Beside the executable first, then the usual install, then the path.
@@ -62,6 +68,31 @@ namespace
         if (HMODULE module = LoadLibraryExW(usual.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) return module;
         return LoadLibraryW(name);
     }
+#else
+    HMODULE LoadFrom(const char* name)
+    {
+        const std::filesystem::path exeDir = Platform::ExecutableDirectory();
+        if (!exeDir.empty())
+        {
+            const std::filesystem::path beside = exeDir / name;
+            if (void* module = dlopen(beside.c_str(), RTLD_LAZY | RTLD_LOCAL))
+                return module;
+        }
+        static const char* const searchDirs[] = {
+            "/opt/homebrew/opt/ffmpeg/lib",
+            "/opt/homebrew/lib",
+            "/usr/local/opt/ffmpeg/lib",
+            "/usr/local/lib",
+        };
+        for (const char* dir : searchDirs)
+        {
+            const std::filesystem::path candidate = std::filesystem::path(dir) / name;
+            if (void* module = dlopen(candidate.c_str(), RTLD_LAZY | RTLD_LOCAL))
+                return module;
+        }
+        return dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+    }
+#endif
 
     const Ffmpeg& Library()
     {
@@ -70,6 +101,7 @@ namespace
         std::call_once(once, []() {
             // The names carry the major version the headers were for; a
             // library of another major would not match the structures.
+#ifdef _WIN32
             const std::wstring codec = L"avcodec-" + std::to_wstring(LIBAVCODEC_VERSION_MAJOR) + L".dll";
             const std::wstring util = L"avutil-" + std::to_wstring(LIBAVUTIL_VERSION_MAJOR) + L".dll";
             HMODULE utilModule = LoadFrom(util.c_str());
@@ -86,6 +118,24 @@ namespace
                 slot = reinterpret_cast<std::remove_reference_t<decltype(slot)>>(GetProcAddress(module, name));
                 if (slot == nullptr) { ok = false; ffmpeg.problem = std::string(name) + " is missing"; }
             };
+#else
+            const std::string codec = "libavcodec." + std::to_string(LIBAVCODEC_VERSION_MAJOR) + ".dylib";
+            const std::string util = "libavutil." + std::to_string(LIBAVUTIL_VERSION_MAJOR) + ".dylib";
+            HMODULE utilModule = LoadFrom(util.c_str());
+            if (!utilModule) utilModule = LoadFrom("libavutil.dylib");
+            HMODULE codecModule = utilModule ? LoadFrom(codec.c_str()) : nullptr;
+            if (!codecModule && utilModule) codecModule = LoadFrom("libavcodec.dylib");
+            if (utilModule == nullptr || codecModule == nullptr)
+            {
+                ffmpeg.problem = codec + " and " + util + " were not found";
+                return;
+            }
+            bool ok = true;
+            auto get = [&](HMODULE module, const char* name, auto& slot) {
+                slot = reinterpret_cast<std::remove_reference_t<decltype(slot)>>(dlsym(module, name));
+                if (slot == nullptr) { ok = false; ffmpeg.problem = std::string(name) + " is missing"; }
+            };
+#endif
             get(codecModule, "avcodec_find_decoder", ffmpeg.find_decoder);
             get(codecModule, "avcodec_alloc_context3", ffmpeg.alloc_context);
             get(codecModule, "avcodec_open2", ffmpeg.open);

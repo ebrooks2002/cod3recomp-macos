@@ -20,7 +20,13 @@
 #include <cstring>
 #include <thread>
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include <CoreFoundation/CoreFoundation.h>
+#include "platform.h"
+#include <SDL2/SDL.h>
+#endif
 
 namespace
 {
@@ -47,9 +53,12 @@ namespace
     std::atomic<uint64_t> g_guestFrames{ 0 };
 
     bool g_borderless = false;
+#ifdef _WIN32
     WINDOWPLACEMENT g_placement{};
+#endif
     std::atomic<bool> g_toggleWanted{ false };   // Alt+Enter
 
+#ifdef _WIN32
     void ReportSize(HWND window)
     {
         RECT client{};
@@ -277,19 +286,105 @@ namespace
         g_window.store(nullptr);
         DestroyWindow(window);
     }
+#else
+    std::atomic<bool> g_hasFocus{ true };
+
+    void ReportSize(SDL_Window* window)
+    {
+        if (!window) return;
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(window, &w, &h);
+        if (w <= 0 || h <= 0) SDL_GetWindowSize(window, &w, &h);
+        Render::SetWindow(window, w, h);
+    }
+
+    void SetBorderless(SDL_Window* window, bool borderless)
+    {
+        if (!window || borderless == g_borderless) return;
+        g_borderless = borderless;
+        SDL_SetWindowFullscreen(window, borderless ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        ReportSize(window);
+    }
+#endif
 }
 
 void Window::Open()
 {
+#ifdef _WIN32
     bool expected = false;
     if (!g_running.compare_exchange_strong(expected, true)) return;
     g_thread = std::thread(WindowThread);
+#else
+    bool expected = false;
+    if (!g_running.compare_exchange_strong(expected, true)) return;
+
+    if ((SDL_WasInit(SDL_INIT_VIDEO) & SDL_INIT_VIDEO) == 0)
+    {
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+        {
+            fprintf(stderr, "window: SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s\n", SDL_GetError());
+            g_running.store(false);
+            return;
+        }
+    }
+    if ((SDL_WasInit(SDL_INIT_GAMECONTROLLER) & SDL_INIT_GAMECONTROLLER) == 0)
+    {
+        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    }
+
+    static const bool hidden = []() {
+        const char* text = getenv("COD3_HIDDEN_WINDOW");
+        return text != nullptr && text[0] != 0 && text[0] != '0';
+    }();
+    Uint32 flags = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    if (hidden) flags |= SDL_WINDOW_HIDDEN;
+
+    SDL_Window* window = SDL_CreateWindow(
+        "Call of Duty 3 - recompiled",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        Width, Height, flags);
+    if (window == nullptr)
+    {
+        fprintf(stderr, "window: could not be created: %s\n", SDL_GetError());
+        g_running.store(false);
+        return;
+    }
+
+    g_borderless = false;
+    g_window.store(window);
+    g_rawRegistered.store(true);
+    g_hasFocus.store((SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0 || !hidden);
+    ReportSize(window);
+
+    static const bool background = []() {
+        const char* text = getenv("COD3_BACKGROUND");
+        return text != nullptr && text[0] != 0 && text[0] != '0';
+    }();
+    if (!background && !hidden)
+    {
+        SDL_RaiseWindow(window);
+    }
+
+    printf("window: open at %dx%d\n", Width, Height);
+    fflush(stdout);
+#endif
 }
 
 void Window::Close()
 {
+#ifdef _WIN32
     if (g_running.exchange(false) && g_thread.joinable())
         g_thread.join();
+#else
+    g_running.store(false, std::memory_order_release);
+    if (SDL_Window* window = static_cast<SDL_Window*>(g_window.exchange(nullptr)))
+    {
+        Render::SetWindow(nullptr, 0, 0);
+        SDL_SetRelativeMouseMode(SDL_FALSE);
+        SDL_ShowCursor(SDL_ENABLE);
+        SDL_DestroyWindow(window);
+    }
+#endif
 }
 
 bool Window::IsOpen() { return g_running.load(); }
@@ -299,18 +394,27 @@ void* Window::Handle() { return g_window.load(); }
 void Window::SetCursorHidden(bool hidden)
 {
     g_cursorHidden.store(hidden);
-
+#ifdef _WIN32
     // The pointer is already sitting over the window, so nothing would ask
     // again until it moved. Sending the question once makes the change show.
     const HWND window = g_window.load();
     if (window != nullptr)
         PostMessageW(window, WM_SETCURSOR, WPARAM(window), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+#else
+    SDL_ShowCursor(hidden ? SDL_DISABLE : SDL_ENABLE);
+#endif
 }
 
 bool Window::HasFocus()
 {
+#ifdef _WIN32
     const HWND window = g_window.load();
     return window != nullptr && GetForegroundWindow() == window;
+#else
+    auto* window = static_cast<SDL_Window*>(g_window.load());
+    if (window == nullptr) return false;
+    return (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0 || g_hasFocus.load(std::memory_order_relaxed);
+#endif
 }
 
 bool Window::TakeRawMouse(long& x, long& y)
@@ -322,6 +426,106 @@ bool Window::TakeRawMouse(long& x, long& y)
 }
 
 int Window::TakeWheel() { return g_wheel.exchange(0); }
+
+void Window::PumpOnCurrentThread()
+{
+#ifndef _WIN32
+    static const int fullscreenOverride = []() { const char* t = getenv("COD3_FULLSCREEN"); return t ? (t[0] == '0' ? 0 : 1) : -1; }();
+    int appliedWidth = 0, appliedHeight = 0;
+
+    while (g_running.load(std::memory_order_acquire))
+    {
+        auto* window = static_cast<SDL_Window*>(g_window.load(std::memory_order_acquire));
+        if (window == nullptr) break;
+
+        SDL_Event event{};
+        while (SDL_PollEvent(&event))
+        {
+            if (event.type == SDL_QUIT)
+            {
+                g_running.store(false, std::memory_order_release);
+                break;
+            }
+            if (event.type == SDL_WINDOWEVENT)
+            {
+                if (event.window.event == SDL_WINDOWEVENT_CLOSE)
+                {
+                    g_running.store(false, std::memory_order_release);
+                    break;
+                }
+                if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                    g_hasFocus.store(true, std::memory_order_relaxed);
+                else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                    g_hasFocus.store(false, std::memory_order_relaxed);
+                else if (event.window.event == SDL_WINDOWEVENT_RESIZED ||
+                         event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
+                {
+                    ReportSize(window);
+                }
+            }
+            // Alt+Enter: the other window mode, through the settings so it sticks.
+            if (event.type == SDL_KEYDOWN &&
+                (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_KP_ENTER) &&
+                (event.key.keysym.mod & KMOD_ALT) != 0)
+            {
+                g_toggleWanted.store(true, std::memory_order_relaxed);
+                continue;
+            }
+            if (Overlay::HandleSDLEvent(&event))
+                continue;
+
+            if (event.type == SDL_MOUSEWHEEL)
+            {
+                int delta = event.wheel.y;
+                if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) delta = -delta;
+                g_wheel.fetch_add(delta, std::memory_order_relaxed);
+            }
+            else if (event.type == SDL_MOUSEMOTION)
+            {
+                g_rawX.fetch_add(event.motion.xrel, std::memory_order_relaxed);
+                g_rawY.fetch_add(event.motion.yrel, std::memory_order_relaxed);
+            }
+        }
+        if (!g_running.load(std::memory_order_acquire)) break;
+
+        Settings::Values settings = Settings::Get();
+        if (g_toggleWanted.exchange(false))
+        {
+            settings.windowMode = settings.windowMode == 0 ? 1 : 0;
+            Settings::Set(settings);
+        }
+        const bool borderless = fullscreenOverride >= 0 ? fullscreenOverride != 0 : settings.windowMode == 1;
+        SetBorderless(window, borderless);
+        {
+            int width = 0, height = 0;
+            Settings::Resolution(settings, width, height);
+            if (!borderless && (width != appliedWidth || height != appliedHeight))
+            {
+                appliedWidth = width;
+                appliedHeight = height;
+                SDL_Rect usable{ 0, 0, width, height };
+                const int displayIdx = SDL_GetWindowDisplayIndex(window);
+                if (SDL_GetDisplayUsableBounds(displayIdx >= 0 ? displayIdx : 0, &usable) == 0 &&
+                    usable.w > 0 && usable.h > 0)
+                {
+                    if (width > usable.w) width = usable.w;
+                    if (height > usable.h) height = usable.h;
+                }
+                SDL_SetWindowSize(window, width, height);
+                SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                ReportSize(window);
+            }
+        }
+
+        Render::PresentIdle();
+        // Drain any main-queue blocks (such as CAMetalLayer creation/resize from the GPU thread).
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+
+    Window::Close();
+#endif
+}
 
 void Window::SetFrontBuffer(uint32_t address, uint32_t width, uint32_t height)
 {

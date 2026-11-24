@@ -12,7 +12,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
 #include <Windows.h>
+#else
+#include "platform.h"
+#include <SDL2/SDL.h>
+#endif
 
 namespace
 {
@@ -47,6 +52,7 @@ namespace
         XInputGamepad gamepad;
     };
 
+#ifdef _WIN32
     using GetStateFunction = uint32_t (WINAPI*)(uint32_t, XInputState*);
     GetStateFunction g_getState = nullptr;
     bool g_looked = false;
@@ -71,6 +77,158 @@ namespace
     }
 
     bool Down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+#else
+    SDL_GameController* g_controller = nullptr;
+
+    void FindXInput()
+    {
+        if (g_controller != nullptr && !SDL_GameControllerGetAttached(g_controller))
+        {
+            SDL_GameControllerClose(g_controller);
+            g_controller = nullptr;
+        }
+        if (g_controller != nullptr) return;
+        if ((SDL_WasInit(SDL_INIT_GAMECONTROLLER) & SDL_INIT_GAMECONTROLLER) == 0)
+            return;
+        const int numJoysticks = SDL_NumJoysticks();
+        for (int i = 0; i < numJoysticks; ++i)
+        {
+            if (SDL_IsGameController(i))
+            {
+                g_controller = SDL_GameControllerOpen(i);
+                if (g_controller != nullptr) break;
+            }
+        }
+    }
+
+    uint32_t ReadSdlController(XInputState* outState)
+    {
+        if (!outState) return 1;
+        *outState = XInputState{};
+        if (g_controller == nullptr || !SDL_GameControllerGetAttached(g_controller))
+            return 1;
+
+        uint16_t btns = 0;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_UP))       btns |= PadUp;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN))     btns |= PadDown;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT))     btns |= PadLeft;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT))    btns |= PadRight;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_START))         btns |= PadStart;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_BACK))          btns |= PadBack;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSTICK))     btns |= PadLeftThumb;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_RIGHTSTICK))    btns |= PadRightThumb;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  btns |= PadLeftShoulder;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) btns |= PadRightShoulder;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_A))             btns |= PadA;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_B))             btns |= PadB;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_X))             btns |= PadX;
+        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))             btns |= PadY;
+
+        const Sint16 lt = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+        const Sint16 rt = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+        outState->gamepad.buttons = btns;
+        outState->gamepad.leftTrigger  = lt > 0 ? uint8_t(std::min<int>(255, int(lt) * 255 / 32767)) : 0;
+        outState->gamepad.rightTrigger = rt > 0 ? uint8_t(std::min<int>(255, int(rt) * 255 / 32767)) : 0;
+
+        auto deadzone = [](Sint16 v) -> int16_t {
+            if (std::abs(int(v)) < 4000) return 0;
+            return int16_t(std::clamp<int>(v, -32767, 32767));
+        };
+        outState->gamepad.thumbLX = deadzone(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX));
+        outState->gamepad.thumbLY = int16_t(-int(deadzone(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY))));
+        outState->gamepad.thumbRX = deadzone(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTX));
+        outState->gamepad.thumbRY = int16_t(-int(deadzone(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTY))));
+        return ERROR_SUCCESS;
+    }
+
+    SDL_Scancode VkToScancode(int vk)
+    {
+        if (vk >= 'A' && vk <= 'Z') return SDL_Scancode(SDL_SCANCODE_A + (vk - 'A'));
+        if (vk == '0') return SDL_SCANCODE_0;
+        if (vk >= '1' && vk <= '9') return SDL_Scancode(SDL_SCANCODE_1 + (vk - '1'));
+        if (vk >= VK_F1 && vk <= VK_F12) return SDL_Scancode(SDL_SCANCODE_F1 + (vk - VK_F1));
+        if (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9) return SDL_Scancode(SDL_SCANCODE_KP_1 + (vk - VK_NUMPAD1));
+        if (vk == VK_NUMPAD0) return SDL_SCANCODE_KP_0;
+        switch (vk)
+        {
+        case VK_RETURN:     return SDL_SCANCODE_RETURN;
+        case VK_ESCAPE:     return SDL_SCANCODE_ESCAPE;
+        case VK_BACK:       return SDL_SCANCODE_BACKSPACE;
+        case VK_TAB:        return SDL_SCANCODE_TAB;
+        case VK_SPACE:      return SDL_SCANCODE_SPACE;
+        case VK_CAPITAL:    return SDL_SCANCODE_CAPSLOCK;
+        case VK_LSHIFT:     return SDL_SCANCODE_LSHIFT;
+        case VK_RSHIFT:     return SDL_SCANCODE_RSHIFT;
+        case VK_LCONTROL:   return SDL_SCANCODE_LCTRL;
+        case VK_RCONTROL:   return SDL_SCANCODE_RCTRL;
+        case VK_LMENU:      return SDL_SCANCODE_LALT;
+        case VK_RMENU:      return SDL_SCANCODE_RALT;
+        case VK_UP:         return SDL_SCANCODE_UP;
+        case VK_DOWN:       return SDL_SCANCODE_DOWN;
+        case VK_LEFT:       return SDL_SCANCODE_LEFT;
+        case VK_RIGHT:      return SDL_SCANCODE_RIGHT;
+        case VK_INSERT:     return SDL_SCANCODE_INSERT;
+        case VK_DELETE:     return SDL_SCANCODE_DELETE;
+        case VK_HOME:       return SDL_SCANCODE_HOME;
+        case VK_END:        return SDL_SCANCODE_END;
+        case VK_PRIOR:      return SDL_SCANCODE_PAGEUP;
+        case VK_NEXT:       return SDL_SCANCODE_PAGEDOWN;
+        case VK_OEM_1:      return SDL_SCANCODE_SEMICOLON;
+        case VK_OEM_PLUS:   return SDL_SCANCODE_EQUALS;
+        case VK_OEM_COMMA:  return SDL_SCANCODE_COMMA;
+        case VK_OEM_MINUS:  return SDL_SCANCODE_MINUS;
+        case VK_OEM_PERIOD: return SDL_SCANCODE_PERIOD;
+        case VK_OEM_2:      return SDL_SCANCODE_SLASH;
+        case VK_OEM_3:      return SDL_SCANCODE_GRAVE;
+        case VK_OEM_4:      return SDL_SCANCODE_LEFTBRACKET;
+        case VK_OEM_5:      return SDL_SCANCODE_BACKSLASH;
+        case VK_OEM_6:      return SDL_SCANCODE_RIGHTBRACKET;
+        case VK_OEM_7:      return SDL_SCANCODE_APOSTROPHE;
+        default:            return SDL_SCANCODE_UNKNOWN;
+        }
+    }
+
+    bool Down(int key)
+    {
+        if (key == VK_LBUTTON || key == VK_RBUTTON || key == VK_MBUTTON || key == VK_XBUTTON1 || key == VK_XBUTTON2)
+        {
+            const Uint32 buttons = SDL_GetMouseState(nullptr, nullptr);
+            if (key == VK_LBUTTON)  return (buttons & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+            if (key == VK_RBUTTON)  return (buttons & SDL_BUTTON(SDL_BUTTON_RIGHT)) != 0;
+            if (key == VK_MBUTTON)  return (buttons & SDL_BUTTON(SDL_BUTTON_MIDDLE)) != 0;
+            if (key == VK_XBUTTON1) return (buttons & SDL_BUTTON(SDL_BUTTON_X1)) != 0;
+            if (key == VK_XBUTTON2) return (buttons & SDL_BUTTON(SDL_BUTTON_X2)) != 0;
+            return false;
+        }
+        int numKeys = 0;
+        const Uint8* state = SDL_GetKeyboardState(&numKeys);
+        if (!state || numKeys <= 0) return false;
+        if (key == VK_SHIFT)
+            return state[SDL_SCANCODE_LSHIFT] != 0 || state[SDL_SCANCODE_RSHIFT] != 0;
+        if (key == VK_CONTROL)
+            return state[SDL_SCANCODE_LCTRL] != 0 || state[SDL_SCANCODE_RCTRL] != 0;
+        if (key == VK_MENU)
+            return state[SDL_SCANCODE_LALT] != 0 || state[SDL_SCANCODE_RALT] != 0;
+        const SDL_Scancode sc = VkToScancode(key);
+        return sc != SDL_SCANCODE_UNKNOWN && int(sc) < numKeys && state[sc] != 0;
+    }
+
+    BOOL GetCursorPos(POINT* pt)
+    {
+        if (!pt) return FALSE;
+        int x = 0, y = 0;
+        SDL_GetMouseState(&x, &y);
+        pt->x = x;
+        pt->y = y;
+        return TRUE;
+    }
+
+    void SetCursorPos(int x, int y)
+    {
+        if (auto* window = static_cast<SDL_Window*>(Window::Handle()))
+            SDL_WarpMouseInWindow(window, x, y);
+    }
+#endif
 
     // The mouse, held by the window.
     //
@@ -87,6 +245,7 @@ namespace
     {
         if (g_mouseHeld.load() == hold) return;
 
+#ifdef _WIN32
         const HWND window = static_cast<HWND>(Window::Handle());
         if (window == nullptr) return;
 
@@ -118,6 +277,33 @@ namespace
 
         Window::SetCursorHidden(hold);
         g_mouseHeld.store(hold);
+#else
+        auto* window = static_cast<SDL_Window*>(Window::Handle());
+        if (window == nullptr) return;
+
+        if (hold)
+        {
+            int w = 0, h = 0;
+            SDL_GetWindowSize(window, &w, &h);
+            g_centre.x = w / 2;
+            g_centre.y = h / 2;
+            SDL_SetWindowGrab(window, SDL_TRUE);
+            SDL_SetRelativeMouseMode(SDL_TRUE);
+            printf("input: the mouse is held by the window and steers; "
+                   "Escape gives it back\n");
+        }
+        else
+        {
+            SDL_SetRelativeMouseMode(SDL_FALSE);
+            SDL_SetWindowGrab(window, SDL_FALSE);
+            printf("input: the mouse is free; click in the window to steer "
+                   "with it\n");
+        }
+        fflush(stdout);
+
+        Window::SetCursorHidden(hold);
+        g_mouseHeld.store(hold);
+#endif
     }
 
     // How far the pointer moved since the last look, in stick units. Full
@@ -140,12 +326,14 @@ namespace
         {
             dx = rawX;
             dy = rawY;
+#ifdef _WIN32
             // The pointer is still put back in the middle: it is hidden and
             // nothing reads it, but a click has to land in the window and it
             // must never come to rest against an edge of the screen.
             POINT now{};
             if (GetCursorPos(&now) && (now.x != g_centre.x || now.y != g_centre.y))
                 SetCursorPos(g_centre.x, g_centre.y);
+#endif
         }
         else
         {
@@ -558,10 +746,15 @@ namespace
             const char* text = getenv("COD3_NOPAD");
             return text != nullptr && text[0] != 0 && text[0] != '0';
         }();
-        if (g_getState != nullptr && !padIgnored && Settings::Get().controller)
+        if (!padIgnored && Settings::Get().controller)
         {
             XInputState state{};
-            if (g_getState(0, &state) == ERROR_SUCCESS)
+#ifdef _WIN32
+            const bool havePad = (g_getState != nullptr && g_getState(0, &state) == ERROR_SUCCESS);
+#else
+            const bool havePad = (ReadSdlController(&state) == ERROR_SUCCESS);
+#endif
+            if (havePad)
             {
                 fromPad = state.gamepad.buttons;
                 pad.buttons |= state.gamepad.buttons;
