@@ -11,8 +11,13 @@
 #include <thread>
 #include <chrono>
 
+#ifdef _WIN32
 #include <Windows.h>
 #include <mmsystem.h>
+#else
+#include "platform.h"
+#include <SDL2/SDL.h>
+#endif
 
 namespace
 {
@@ -28,12 +33,18 @@ namespace
     constexpr int Buffers = 8;
 
     std::mutex g_mutex;
+#ifdef _WIN32
     HWAVEOUT g_device = nullptr;
+#else
+    SDL_AudioDeviceID g_device = 0;
+#endif
     bool g_tried = false;
 
     struct Block
     {
+#ifdef _WIN32
         WAVEHDR header{};
+#endif
         int16_t samples[SamplesPerChannel * 2]{};   // stereo
     };
     Block g_blocks[Buffers];
@@ -72,10 +83,12 @@ namespace
 
     void Dump(const int16_t* samples, size_t bytes)
     {
-        static const char* const path = getenv("COD3_AUDIODUMP");
-        if (path == nullptr) return;
+        const char* path = getenv("COD3_AUDIODUMP");
+        if (path == nullptr || path[0] == '\0') return;
         if (g_dump == nullptr)
         {
+            g_dumpBytes = 0;
+            g_dumpFrames = 0;
             g_dump = fopen(path, "wb");
             if (g_dump == nullptr) return;
             DumpHeader();
@@ -106,6 +119,7 @@ namespace
 bool Audio::Open()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+#ifdef _WIN32
     if (g_device != nullptr) return true;
     if (g_tried) return false;
     g_tried = true;
@@ -137,6 +151,38 @@ bool Audio::Open()
         // Marked done so the first pass through finds them all free.
         block.header.dwFlags |= WHDR_DONE;
     }
+#else
+    if (g_device != 0) return true;
+    if (g_tried) return false;
+    g_tried = true;
+
+    if ((SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) == 0)
+    {
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
+        {
+            printf("audio: no output device, the run will be silent (%s)\n", SDL_GetError());
+            fflush(stdout);
+            return false;
+        }
+    }
+
+    SDL_AudioSpec want{};
+    want.freq = SampleRate;
+    want.format = AUDIO_S16SYS;
+    want.channels = 2;
+    want.samples = SamplesPerChannel;
+    want.callback = nullptr;
+
+    SDL_AudioSpec have{};
+    g_device = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (g_device == 0)
+    {
+        printf("audio: no output device, the run will be silent (%s)\n", SDL_GetError());
+        fflush(stdout);
+        return false;
+    }
+    SDL_PauseAudioDevice(g_device, 0);
+#endif
 
     printf("audio: playing the title's own mix, 48 kHz stereo\n");
     fflush(stdout);
@@ -146,6 +192,7 @@ bool Audio::Open()
 void Audio::Close()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+#ifdef _WIN32
     if (g_device == nullptr) return;
 
     waveOutReset(g_device);
@@ -153,6 +200,22 @@ void Audio::Close()
         waveOutUnprepareHeader(g_device, &block.header, sizeof(WAVEHDR));
     waveOutClose(g_device);
     g_device = nullptr;
+#else
+    if (g_device != 0)
+    {
+        SDL_ClearQueuedAudio(g_device);
+        SDL_CloseAudioDevice(g_device);
+        g_device = 0;
+    }
+    if (g_dump != nullptr)
+    {
+        DumpHeader();
+        fflush(g_dump);
+        fclose(g_dump);
+        g_dump = nullptr;
+    }
+    g_tried = false;
+#endif
 }
 
 bool Audio::SubmitFrame(uint32_t guestAddress)
@@ -161,7 +224,11 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
     if (!Open()) return false;
 
     std::unique_lock<std::mutex> lock(g_mutex);
+#ifdef _WIN32
     if (g_device == nullptr) return false;
+#else
+    if (g_device == 0) return false;
+#endif
 
     // The next buffer in the ring, once the device has finished with it.
     // The frames come from this runtime's own pump thread, so a short wait
@@ -170,6 +237,7 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
     // apart. Longer than a few frames' worth and the frame is dropped
     // rather than the pump held.
     Block& block = g_blocks[g_next];
+#ifdef _WIN32
     for (int waited = 0; (block.header.dwFlags & WHDR_DONE) == 0; waited++)
     {
         if (waited >= 20)
@@ -181,6 +249,21 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         lock.lock();
     }
+#else
+    constexpr uint32_t MaxQueuedBytes = uint32_t(Buffers * sizeof(block.samples));
+    for (int waited = 0; g_device != 0 && SDL_GetQueuedAudioSize(g_device) >= MaxQueuedBytes; waited++)
+    {
+        if (waited >= 20)
+        {
+            g_dropped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock.lock();
+    }
+    if (g_device == 0) return false;
+#endif
     g_next = (g_next + 1) % Buffers;
 
     // Six channels, one after another in memory, in the console's order: left,
@@ -217,6 +300,7 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
     }
 
     Dump(block.samples, sizeof(block.samples));
+#ifdef _WIN32
     block.header.dwFlags &= ~WHDR_DONE;
     block.header.dwBufferLength = sizeof(block.samples);
     if (waveOutWrite(g_device, &block.header, sizeof(WAVEHDR)) != MMSYSERR_NOERROR)
@@ -225,6 +309,13 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
         g_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+#else
+    if (SDL_QueueAudio(g_device, block.samples, sizeof(block.samples)) != 0)
+    {
+        g_dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+#endif
 
     g_played.fetch_add(1, std::memory_order_relaxed);
     return true;

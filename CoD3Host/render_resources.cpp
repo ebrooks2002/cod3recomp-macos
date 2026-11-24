@@ -12,15 +12,22 @@
 #include <cstring>
 #include <deque>
 #include <chrono>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "platform.h"
 #include <d3d11_1.h>
 #include <wrl/client.h>
+
+#ifdef __APPLE__
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
+#endif
 
 using Microsoft::WRL::ComPtr;
 
@@ -40,6 +47,122 @@ namespace
     std::atomic<uint64_t> g_indexBytes{ 0 }, g_constantBytes{ 0 };
     uint64_t g_resourceBytes = 0;
     uint32_t g_released = 0;
+
+    // --- static texture replacement (PNG overrides keyed by level-0 content hash) -------------
+
+    uint64_t TextureContentHash(uint32_t width, uint32_t height, uint32_t format, const uint8_t* data, size_t size)
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        auto mix32 = [&](uint32_t v) {
+            for (int i = 0; i < 4; ++i) { h ^= (v >> (i * 8)) & 0xFFu; h *= 0x100000001b3ull; }
+        };
+        mix32(width);
+        mix32(height);
+        mix32(format);
+        for (size_t i = 0; i < size; ++i) { h ^= data[i]; h *= 0x100000001b3ull; }
+        return h;
+    }
+
+    const std::unordered_map<uint64_t, std::filesystem::path>& TextureReplacements()
+    {
+        static const auto table = []() {
+            std::unordered_map<uint64_t, std::filesystem::path> map;
+            std::vector<std::filesystem::path> dirs;
+            if (const char* envDir = getenv("COD3_TEXTURE_DIR"); envDir && envDir[0])
+                dirs.emplace_back(envDir);
+            wchar_t modulePath[MAX_PATH] = {};
+            if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) > 0)
+                dirs.push_back(std::filesystem::path(modulePath).parent_path() / "textures");
+            dirs.emplace_back("textures");
+
+            std::error_code ec;
+            for (const auto& dir : dirs)
+            {
+                if (!std::filesystem::is_directory(dir, ec)) continue;
+                for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
+                {
+                    if (!entry.is_regular_file()) continue;
+                    std::string ext = entry.path().extension().string();
+                    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+                    if (ext != ".png") continue;
+                    const std::string stem = entry.path().stem().string();
+                    // Accept "<16-hex>.png" or "<16-hex>_anything.png"
+                    if (stem.size() < 16) continue;
+                    if (stem.size() > 16 && stem[16] != '_' && stem[16] != '-') continue;
+                    uint64_t hash = 0;
+                    bool ok = true;
+                    for (int i = 0; i < 16; ++i)
+                    {
+                        const char c = stem[i];
+                        uint64_t nibble = 0;
+                        if (c >= '0' && c <= '9') nibble = uint64_t(c - '0');
+                        else if (c >= 'a' && c <= 'f') nibble = uint64_t(10 + (c - 'a'));
+                        else if (c >= 'A' && c <= 'F') nibble = uint64_t(10 + (c - 'A'));
+                        else { ok = false; break; }
+                        hash = (hash << 4) | nibble;
+                    }
+                    if (ok && map.find(hash) == map.end())
+                        map.emplace(hash, entry.path());
+                }
+            }
+            if (!map.empty())
+                printf("render: %zu texture replacement%s ready\n", map.size(), map.size() == 1 ? "" : "s");
+            return map;
+        }();
+        return table;
+    }
+
+    bool LoadReplacementPngRgba(const std::filesystem::path& path, uint32_t& outW, uint32_t& outH, std::vector<uint8_t>& outPixels)
+    {
+#ifdef __APPLE__
+        const std::string fileStr = path.string();
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+            kCFAllocatorDefault, reinterpret_cast<const UInt8*>(fileStr.c_str()),
+            CFIndex(fileStr.size()), false);
+        if (!url) return false;
+        CGImageSourceRef src = CGImageSourceCreateWithURL(url, nullptr);
+        CFRelease(url);
+        if (!src) return false;
+        CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, nullptr);
+        CFRelease(src);
+        if (!img) return false;
+
+        const size_t w = CGImageGetWidth(img);
+        const size_t h = CGImageGetHeight(img);
+        if (w == 0 || h == 0 || w > 8192 || h > 8192) { CGImageRelease(img); return false; }
+
+        outPixels.assign(w * h * 4, 0);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(
+            outPixels.data(), w, h, 8, w * 4, cs,
+            CGBitmapInfo(kCGBitmapByteOrderDefault) | CGBitmapInfo(kCGImageAlphaPremultipliedLast));
+        CGColorSpaceRelease(cs);
+        if (!ctx) { CGImageRelease(img); return false; }
+        CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, CGFloat(w), CGFloat(h)), img);
+        CGContextRelease(ctx);
+        CGImageRelease(img);
+
+        // Un-premultiply RGB so straight-alpha UI blending matches Xbox 360 textures.
+        for (size_t i = 0; i < w * h; ++i)
+        {
+            uint8_t* p = outPixels.data() + i * 4;
+            const uint8_t a = p[3];
+            if (a > 0 && a < 255)
+            {
+                p[0] = uint8_t(std::min<uint32_t>(255u, (uint32_t(p[0]) * 255u + a / 2u) / a));
+                p[1] = uint8_t(std::min<uint32_t>(255u, (uint32_t(p[1]) * 255u + a / 2u) / a));
+                p[2] = uint8_t(std::min<uint32_t>(255u, (uint32_t(p[2]) * 255u + a / 2u) / a));
+            }
+        }
+        outW = uint32_t(w);
+        outH = uint32_t(h);
+        return true;
+#else
+        (void)path; (void)outW; (void)outH; (void)outPixels;
+        return false;
+#endif
+    }
 
     // --- the scale ----------------------------------------------------------------------------
 
@@ -577,19 +700,49 @@ namespace
         }
 
         const uint32_t topWidth = std::max(width >> skip, 1u), topHeight = std::max(height >> skip, 1u);
+
+        // Compute deterministic level-0 content hash when dumping or replacing textures.
+        static const char* const dumpTextures = getenv("COD3_D3DTEXDUMP");
+        const auto& replacements = TextureReplacements();
+        uint64_t contentHash = 0;
+        const bool needHash = !cube && skip == 0 && !pixels[0].empty() && (dumpTextures != nullptr || !replacements.empty());
+        if (needHash)
+            contentHash = TextureContentHash(width, height, format, pixels[0].data(), pixels[0].size());
+
+        // Check static PNG replacement before creating the D3D11 texture.
+        bool replaced = false;
+        std::vector<uint8_t> repPixels;
+        uint32_t repW = 0, repH = 0;
+        if (needHash && !replacements.empty())
+        {
+            if (auto it = replacements.find(contentHash); it != replacements.end())
+            {
+                if (LoadReplacementPngRgba(it->second, repW, repH, repPixels))
+                {
+                    replaced = true;
+                    static std::unordered_set<uint64_t> loggedReplaced;
+                    if (loggedReplaced.insert(contentHash).second)
+                        printf("render: replaced texture %016llX (%ux%u -> %ux%u) from %s\n",
+                            static_cast<unsigned long long>(contentHash), width, height, repW, repH,
+                            it->second.filename().string().c_str());
+                }
+            }
+        }
+
         D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = compressed ? ((topWidth + 3) & ~3u) : topWidth;
-        desc.Height = compressed ? ((topHeight + 3) & ~3u) : topHeight;
-        desc.MipLevels = kept;
+        desc.Width = replaced ? repW : (compressed ? ((topWidth + 3) & ~3u) : topWidth);
+        desc.Height = replaced ? repH : (compressed ? ((topHeight + 3) & ~3u) : topHeight);
+        desc.MipLevels = replaced ? 1u : kept;
         desc.ArraySize = faces;
-        desc.Format = hostFormat;
+        desc.Format = replaced ? DXGI_FORMAT_R8G8B8A8_UNORM : hostFormat;
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_IMMUTABLE;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         desc.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
         entry.texture.Reset();
         entry.resource.Reset();
-        if (FAILED(g_device->CreateTexture2D(&desc, initial.data(), &entry.texture))) return false;
+        D3D11_SUBRESOURCE_DATA repInit{ repPixels.data(), repW * 4u, 0 };
+        if (FAILED(g_device->CreateTexture2D(&desc, replaced ? &repInit : initial.data(), &entry.texture))) return false;
         if (FAILED(g_device->CreateShaderResourceView(entry.texture.Get(), nullptr, &entry.resource))) return false;
         entry.cube = cube;
         entry.face.Reset();
@@ -604,53 +757,58 @@ namespace
         }
         entry.width = width;
         entry.height = height;
-        entry.levels = kept;
+        entry.levels = replaced ? 1u : kept;
+        if (replaced) entry.bytes = repPixels.size();
         g_textureUploads.fetch_add(1, std::memory_order_relaxed);
         g_textureBytes.fetch_add(entry.bytes, std::memory_order_relaxed);
         RenderStats::Frame().textureUploads++;
         RenderStats::Frame().uploadBytes += entry.bytes;
 
-        // COD3_D3DTEXDUMP=directory keeps every texture uploaded, the block
-        // compressed ones as DDS and the rest as BMP, named by address.
-        static const char* const dumpTextures = getenv("COD3_D3DTEXDUMP");
-        if (dumpTextures != nullptr)
+        // COD3_D3DTEXDUMP=directory keeps every unique texture uploaded, the block
+        // compressed ones as DDS and the rest as BMP, named by content hash.
+        if (dumpTextures != nullptr && !cube && skip == 0 && !pixels[0].empty())
         {
-            char name[512];
-            snprintf(name, sizeof(name), "%s/tex-%08X-%ux%u-f%u.%s", dumpTextures, fetch[1] & 0xFFFFF000u, width, height, format, compressed ? "dds" : "bmp");
-            if (FILE* out = fopen(name, "wb"))
+            static std::unordered_set<uint64_t> dumpedHashes;
+            if (dumpedHashes.insert(contentHash).second)
             {
-                const std::vector<uint8_t>& linear = pixels[0];
-                if (compressed)
+                char name[512];
+                snprintf(name, sizeof(name), "%s/tex-%016llX-%ux%u-f%u.%s", dumpTextures,
+                    static_cast<unsigned long long>(contentHash), width, height, format, compressed ? "dds" : "bmp");
+                if (FILE* out = fopen(name, "wb"))
                 {
-                    uint32_t header[32] = {};
-                    header[0] = 0x20534444; header[1] = 124; header[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;
-                    header[3] = height; header[4] = width; header[5] = uint32_t(linear.size());
-                    header[19] = 32; header[20] = 0x4;
-                    header[21] = format == 18 ? 0x31545844 : format == 19 ? 0x33545844 : 0x35545844;
-                    header[27] = 0x1000;
-                    fwrite(header, 4, 32, out);
-                    fwrite(linear.data(), 1, linear.size(), out);
+                    const std::vector<uint8_t>& linear = pixels[0];
+                    if (compressed)
+                    {
+                        uint32_t header[32] = {};
+                        header[0] = 0x20534444; header[1] = 124; header[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;
+                        header[3] = height; header[4] = width; header[5] = uint32_t(linear.size());
+                        header[19] = 32; header[20] = 0x4;
+                        header[21] = format == 18 ? 0x31545844 : format == 19 ? 0x33545844 : 0x35545844;
+                        header[27] = 0x1000;
+                        fwrite(header, 4, 32, out);
+                        fwrite(linear.data(), 1, linear.size(), out);
+                    }
+                    else
+                    {
+                        const uint32_t bytesPerTexel = format == 6 ? 4 : 1;
+                        std::vector<uint8_t> bgra(size_t(width) * height * 4);
+                        for (uint32_t y = 0; y < height; y++)
+                            for (uint32_t x = 0; x < width; x++)
+                            {
+                                const uint8_t* from = linear.data() + size_t(y) * width * bytesPerTexel + size_t(x) * bytesPerTexel;
+                                uint8_t* to = bgra.data() + (size_t(y) * width + x) * 4;
+                                if (bytesPerTexel == 1) { to[0] = to[1] = to[2] = from[0]; to[3] = 255; }
+                                else { to[0] = from[2]; to[1] = from[1]; to[2] = from[0]; to[3] = from[3]; }
+                            }
+                        BITMAPFILEHEADER file{};
+                        BITMAPINFOHEADER info{};
+                        info.biSize = sizeof(info); info.biWidth = int(width); info.biHeight = -int(height); info.biPlanes = 1;
+                        info.biBitCount = 32; info.biCompression = BI_RGB; info.biSizeImage = DWORD(bgra.size());
+                        file.bfType = 0x4D42; file.bfOffBits = sizeof(file) + sizeof(info); file.bfSize = file.bfOffBits + info.biSizeImage;
+                        fwrite(&file, sizeof(file), 1, out); fwrite(&info, sizeof(info), 1, out); fwrite(bgra.data(), 1, bgra.size(), out);
+                    }
+                    fclose(out);
                 }
-                else
-                {
-                    const uint32_t bytesPerTexel = format == 6 ? 4 : 1;
-                    std::vector<uint8_t> bgra(size_t(width) * height * 4);
-                    for (uint32_t y = 0; y < height; y++)
-                        for (uint32_t x = 0; x < width; x++)
-                        {
-                            const uint8_t* from = linear.data() + size_t(y) * width * bytesPerTexel + size_t(x) * bytesPerTexel;
-                            uint8_t* to = bgra.data() + (size_t(y) * width + x) * 4;
-                            if (bytesPerTexel == 1) { to[0] = to[1] = to[2] = from[0]; to[3] = 255; }
-                            else { to[0] = from[2]; to[1] = from[1]; to[2] = from[0]; to[3] = from[3]; }
-                        }
-                    BITMAPFILEHEADER file{};
-                    BITMAPINFOHEADER info{};
-                    info.biSize = sizeof(info); info.biWidth = int(width); info.biHeight = -int(height); info.biPlanes = 1;
-                    info.biBitCount = 32; info.biCompression = BI_RGB; info.biSizeImage = DWORD(bgra.size());
-                    file.bfType = 0x4D42; file.bfOffBits = sizeof(file) + sizeof(info); file.bfSize = file.bfOffBits + info.biSizeImage;
-                    fwrite(&file, sizeof(file), 1, out); fwrite(&info, sizeof(info), 1, out); fwrite(bgra.data(), 1, bgra.size(), out);
-                }
-                fclose(out);
             }
         }
         return true;

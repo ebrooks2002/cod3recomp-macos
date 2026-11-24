@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
 #include <Windows.h>
 #include <d3d11.h>
 #include <wincodec.h>
@@ -25,6 +26,18 @@
 #include "backends/imgui_impl_win32.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+#else
+#include "platform.h"
+#include <d3d11.h>
+#include <wrl/client.h>
+#include <SDL2/SDL.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
+#include <CoreServices/CoreServices.h>
+
+#include "imgui.h"
+#include "backends/imgui_impl_dx11.h"
+#endif
 
 using Microsoft::WRL::ComPtr;
 
@@ -183,6 +196,248 @@ namespace
         g_capturing = -1;
     }
 
+#ifndef _WIN32
+    std::chrono::steady_clock::time_point g_imguiFrameTime{};
+    bool g_suppressNextGraveText = false;
+
+    int SdlKeycodeToVk(SDL_Keycode sym)
+    {
+        if (sym >= SDLK_a && sym <= SDLK_z) return 'A' + int(sym - SDLK_a);
+        if (sym >= SDLK_0 && sym <= SDLK_9) return '0' + int(sym - SDLK_0);
+        if (sym >= SDLK_F1 && sym <= SDLK_F12) return VK_F1 + int(sym - SDLK_F1);
+        if (sym >= SDLK_KP_1 && sym <= SDLK_KP_9) return VK_NUMPAD1 + int(sym - SDLK_KP_1);
+        if (sym == SDLK_KP_0) return VK_NUMPAD0;
+        switch (sym)
+        {
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:     return VK_RETURN;
+        case SDLK_ESCAPE:       return VK_ESCAPE;
+        case SDLK_BACKSPACE:    return VK_BACK;
+        case SDLK_TAB:          return VK_TAB;
+        case SDLK_SPACE:        return VK_SPACE;
+        case SDLK_CAPSLOCK:     return VK_CAPITAL;
+        case SDLK_LSHIFT:       return VK_LSHIFT;
+        case SDLK_RSHIFT:       return VK_RSHIFT;
+        case SDLK_LCTRL:        return VK_LCONTROL;
+        case SDLK_RCTRL:        return VK_RCONTROL;
+        case SDLK_LALT:         return VK_LMENU;
+        case SDLK_RALT:         return VK_RMENU;
+        case SDLK_UP:           return VK_UP;
+        case SDLK_DOWN:         return VK_DOWN;
+        case SDLK_LEFT:         return VK_LEFT;
+        case SDLK_RIGHT:        return VK_RIGHT;
+        case SDLK_INSERT:       return VK_INSERT;
+        case SDLK_DELETE:       return VK_DELETE;
+        case SDLK_HOME:         return VK_HOME;
+        case SDLK_END:          return VK_END;
+        case SDLK_PAGEUP:       return VK_PRIOR;
+        case SDLK_PAGEDOWN:     return VK_NEXT;
+        case SDLK_SEMICOLON:    return VK_OEM_1;
+        case SDLK_EQUALS:       return VK_OEM_PLUS;
+        case SDLK_COMMA:        return VK_OEM_COMMA;
+        case SDLK_MINUS:        return VK_OEM_MINUS;
+        case SDLK_PERIOD:       return VK_OEM_PERIOD;
+        case SDLK_SLASH:        return VK_OEM_2;
+        case SDLK_BACKQUOTE:    return VK_OEM_3;
+        case SDLK_LEFTBRACKET:  return VK_OEM_4;
+        case SDLK_BACKSLASH:    return VK_OEM_5;
+        case SDLK_RIGHTBRACKET: return VK_OEM_6;
+        case SDLK_QUOTE:        return VK_OEM_7;
+        default:                return 0;
+        }
+    }
+
+    ImGuiKey SdlKeycodeToImGuiKey(SDL_Keycode keycode)
+    {
+        switch (keycode)
+        {
+        case SDLK_TAB:          return ImGuiKey_Tab;
+        case SDLK_LEFT:         return ImGuiKey_LeftArrow;
+        case SDLK_RIGHT:        return ImGuiKey_RightArrow;
+        case SDLK_UP:           return ImGuiKey_UpArrow;
+        case SDLK_DOWN:         return ImGuiKey_DownArrow;
+        case SDLK_PAGEUP:       return ImGuiKey_PageUp;
+        case SDLK_PAGEDOWN:     return ImGuiKey_PageDown;
+        case SDLK_HOME:         return ImGuiKey_Home;
+        case SDLK_END:          return ImGuiKey_End;
+        case SDLK_INSERT:       return ImGuiKey_Insert;
+        case SDLK_DELETE:       return ImGuiKey_Delete;
+        case SDLK_BACKSPACE:    return ImGuiKey_Backspace;
+        case SDLK_SPACE:        return ImGuiKey_Space;
+        case SDLK_RETURN:       return ImGuiKey_Enter;
+        case SDLK_ESCAPE:       return ImGuiKey_Escape;
+        case SDLK_QUOTE:        return ImGuiKey_Apostrophe;
+        case SDLK_COMMA:        return ImGuiKey_Comma;
+        case SDLK_MINUS:        return ImGuiKey_Minus;
+        case SDLK_PERIOD:       return ImGuiKey_Period;
+        case SDLK_SLASH:        return ImGuiKey_Slash;
+        case SDLK_SEMICOLON:    return ImGuiKey_Semicolon;
+        case SDLK_EQUALS:       return ImGuiKey_Equal;
+        case SDLK_LEFTBRACKET:  return ImGuiKey_LeftBracket;
+        case SDLK_BACKSLASH:    return ImGuiKey_Backslash;
+        case SDLK_RIGHTBRACKET: return ImGuiKey_RightBracket;
+        case SDLK_BACKQUOTE:    return ImGuiKey_GraveAccent;
+        case SDLK_CAPSLOCK:     return ImGuiKey_CapsLock;
+        case SDLK_KP_ENTER:     return ImGuiKey_KeypadEnter;
+        case SDLK_LCTRL:        return ImGuiKey_LeftCtrl;
+        case SDLK_LSHIFT:       return ImGuiKey_LeftShift;
+        case SDLK_LALT:         return ImGuiKey_LeftAlt;
+        case SDLK_LGUI:         return ImGuiKey_LeftSuper;
+        case SDLK_RCTRL:        return ImGuiKey_RightCtrl;
+        case SDLK_RSHIFT:       return ImGuiKey_RightShift;
+        case SDLK_RALT:         return ImGuiKey_RightAlt;
+        case SDLK_RGUI:         return ImGuiKey_RightSuper;
+        case SDLK_0:            return ImGuiKey_0;
+        case SDLK_1:            return ImGuiKey_1;
+        case SDLK_2:            return ImGuiKey_2;
+        case SDLK_3:            return ImGuiKey_3;
+        case SDLK_4:            return ImGuiKey_4;
+        case SDLK_5:            return ImGuiKey_5;
+        case SDLK_6:            return ImGuiKey_6;
+        case SDLK_7:            return ImGuiKey_7;
+        case SDLK_8:            return ImGuiKey_8;
+        case SDLK_9:            return ImGuiKey_9;
+        case SDLK_a:            return ImGuiKey_A;
+        case SDLK_b:            return ImGuiKey_B;
+        case SDLK_c:            return ImGuiKey_C;
+        case SDLK_d:            return ImGuiKey_D;
+        case SDLK_e:            return ImGuiKey_E;
+        case SDLK_f:            return ImGuiKey_F;
+        case SDLK_g:            return ImGuiKey_G;
+        case SDLK_h:            return ImGuiKey_H;
+        case SDLK_i:            return ImGuiKey_I;
+        case SDLK_j:            return ImGuiKey_J;
+        case SDLK_k:            return ImGuiKey_K;
+        case SDLK_l:            return ImGuiKey_L;
+        case SDLK_m:            return ImGuiKey_M;
+        case SDLK_n:            return ImGuiKey_N;
+        case SDLK_o:            return ImGuiKey_O;
+        case SDLK_p:            return ImGuiKey_P;
+        case SDLK_q:            return ImGuiKey_Q;
+        case SDLK_r:            return ImGuiKey_R;
+        case SDLK_s:            return ImGuiKey_S;
+        case SDLK_t:            return ImGuiKey_T;
+        case SDLK_u:            return ImGuiKey_U;
+        case SDLK_v:            return ImGuiKey_V;
+        case SDLK_w:            return ImGuiKey_W;
+        case SDLK_x:            return ImGuiKey_X;
+        case SDLK_y:            return ImGuiKey_Y;
+        case SDLK_z:            return ImGuiKey_Z;
+        case SDLK_F1:           return ImGuiKey_F1;
+        case SDLK_F2:           return ImGuiKey_F2;
+        case SDLK_F3:           return ImGuiKey_F3;
+        case SDLK_F4:           return ImGuiKey_F4;
+        case SDLK_F5:           return ImGuiKey_F5;
+        case SDLK_F6:           return ImGuiKey_F6;
+        case SDLK_F7:           return ImGuiKey_F7;
+        case SDLK_F8:           return ImGuiKey_F8;
+        case SDLK_F9:           return ImGuiKey_F9;
+        case SDLK_F10:          return ImGuiKey_F10;
+        case SDLK_F11:          return ImGuiKey_F11;
+        case SDLK_F12:          return ImGuiKey_F12;
+        default:                return ImGuiKey_None;
+        }
+    }
+
+    void ImGuiSdlInit()
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        io.BackendPlatformName = "imgui_impl_sdl2_cod3";
+        io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
+        g_imguiFrameTime = std::chrono::steady_clock::now();
+    }
+
+    void ImGuiSdlNewFrame(int fbWidth, int fbHeight)
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        int winW = fbWidth, winH = fbHeight;
+        int drawW = fbWidth, drawH = fbHeight;
+        if (auto* window = static_cast<SDL_Window*>(g_hwnd))
+        {
+            SDL_GetWindowSize(window, &winW, &winH);
+            SDL_GetWindowSizeInPixels(window, &drawW, &drawH);
+            if (winW <= 0 || winH <= 0) { winW = fbWidth; winH = fbHeight; }
+            if (drawW <= 0 || drawH <= 0) { drawW = fbWidth; drawH = fbHeight; }
+        }
+        io.DisplaySize = ImVec2(float(fbWidth), float(fbHeight));
+        io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::chrono::duration<float>(now - g_imguiFrameTime).count();
+        g_imguiFrameTime = now;
+        io.DeltaTime = dt > 0.0f ? dt : (1.0f / 60.0f);
+    }
+
+    void ImGuiSdlProcessEvent(const SDL_Event& event)
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        float scaleX = 1.0f, scaleY = 1.0f;
+        if (auto* window = static_cast<SDL_Window*>(g_hwnd))
+        {
+            int winW = 0, winH = 0, drawW = 0, drawH = 0;
+            SDL_GetWindowSize(window, &winW, &winH);
+            SDL_GetWindowSizeInPixels(window, &drawW, &drawH);
+            if (winW > 0 && drawW > 0) scaleX = float(drawW) / float(winW);
+            if (winH > 0 && drawH > 0) scaleY = float(drawH) / float(winH);
+        }
+
+        switch (event.type)
+        {
+        case SDL_MOUSEMOTION:
+            io.AddMousePosEvent(float(event.motion.x) * scaleX, float(event.motion.y) * scaleY);
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP:
+        {
+            int button = -1;
+            if (event.button.button == SDL_BUTTON_LEFT)   button = 0;
+            if (event.button.button == SDL_BUTTON_RIGHT)  button = 1;
+            if (event.button.button == SDL_BUTTON_MIDDLE) button = 2;
+            if (event.button.button == SDL_BUTTON_X1)     button = 3;
+            if (event.button.button == SDL_BUTTON_X2)     button = 4;
+            if (button != -1)
+            {
+                io.AddMousePosEvent(float(event.button.x) * scaleX, float(event.button.y) * scaleY);
+                io.AddMouseButtonEvent(button, event.type == SDL_MOUSEBUTTONDOWN);
+            }
+            break;
+        }
+        case SDL_MOUSEWHEEL:
+        {
+            float wheelX = -float(event.wheel.x);
+            float wheelY = float(event.wheel.y);
+            if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { wheelX = -wheelX; wheelY = -wheelY; }
+            io.AddMouseWheelEvent(wheelX, wheelY);
+            break;
+        }
+        case SDL_TEXTINPUT:
+            io.AddInputCharactersUTF8(event.text.text);
+            break;
+        case SDL_KEYDOWN:
+        case SDL_KEYUP:
+        {
+            const Uint16 mod = event.key.keysym.mod;
+            io.AddKeyEvent(ImGuiMod_Ctrl,  (mod & KMOD_CTRL) != 0);
+            io.AddKeyEvent(ImGuiMod_Shift, (mod & KMOD_SHIFT) != 0);
+            io.AddKeyEvent(ImGuiMod_Alt,   (mod & KMOD_ALT) != 0);
+            io.AddKeyEvent(ImGuiMod_Super, (mod & KMOD_GUI) != 0);
+            const ImGuiKey key = SdlKeycodeToImGuiKey(event.key.keysym.sym);
+            if (key != ImGuiKey_None)
+                io.AddKeyEvent(key, event.type == SDL_KEYDOWN);
+            break;
+        }
+        case SDL_WINDOWEVENT:
+            if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                io.AddFocusEvent(true);
+            else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                io.AddFocusEvent(false);
+            break;
+        default:
+            break;
+        }
+    }
+#endif
+
     void SaveScreenshot(ID3D11Texture2D* back, int width, int height)
     {
         D3D11_TEXTURE2D_DESC desc{};
@@ -198,9 +453,21 @@ namespace
         if (FAILED(g_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
 
         // Beside the executable, named by the moment.
-        wchar_t exe[MAX_PATH];
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        std::filesystem::path folder = std::filesystem::path(exe).parent_path() / "screenshots";
+        std::filesystem::path folder;
+        if (const char* overrideDir = getenv("COD3_SCREENSHOT_DIR"); overrideDir && overrideDir[0] != '\0')
+        {
+            folder = overrideDir;
+        }
+        else
+        {
+#ifdef _WIN32
+            wchar_t exe[MAX_PATH];
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            folder = std::filesystem::path(exe).parent_path() / "screenshots";
+#else
+            folder = Platform::ExecutableDirectory() / "screenshots";
+#endif
+        }
         std::error_code ec;
         std::filesystem::create_directories(folder, ec);
         const std::time_t now = std::time(nullptr);
@@ -210,11 +477,12 @@ namespace
         strftime(name, sizeof(name), "CoD3-%Y%m%d-%H%M%S.png", &local);
         const std::filesystem::path file = folder / name;
 
+        bool ok = false;
+#ifdef _WIN32
         ComPtr<IWICImagingFactory> factory;
         ComPtr<IWICBitmapEncoder> encoder;
         ComPtr<IWICBitmapFrameEncode> frame;
         ComPtr<IWICStream> stream;
-        bool ok = false;
         if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
             SUCCEEDED(factory->CreateStream(&stream)) &&
             SUCCEEDED(stream->InitializeFromFilename(file.c_str(), GENERIC_WRITE)) &&
@@ -241,6 +509,59 @@ namespace
                      SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
             }
         }
+#else
+        std::vector<uint8_t> rows(size_t(width) * height * 4);
+        const bool isBgra = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                             desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                             desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+                             desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM);
+        for (int y = 0; y < height; y++)
+        {
+            const uint8_t* from = static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch;
+            uint8_t* to = rows.data() + size_t(y) * width * 4;
+            for (int x = 0; x < width; x++)
+            {
+                if (isBgra)
+                {
+                    to[x * 4 + 0] = from[x * 4 + 2];
+                    to[x * 4 + 1] = from[x * 4 + 1];
+                    to[x * 4 + 2] = from[x * 4 + 0];
+                }
+                else
+                {
+                    to[x * 4 + 0] = from[x * 4 + 0];
+                    to[x * 4 + 1] = from[x * 4 + 1];
+                    to[x * 4 + 2] = from[x * 4 + 2];
+                }
+                to[x * 4 + 3] = 255;
+            }
+        }
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef provider = CGDataProviderCreateWithData(nullptr, rows.data(), rows.size(), nullptr);
+        CGImageRef cgImage = (colorSpace && provider)
+            ? CGImageCreate(size_t(width), size_t(height), 8, 32, size_t(width) * 4, colorSpace,
+                            CGBitmapInfo(kCGBitmapByteOrderDefault) | CGBitmapInfo(kCGImageAlphaNoneSkipLast),
+                            provider, nullptr, false, kCGRenderingIntentDefault)
+            : nullptr;
+        const std::string fileStr = file.string();
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+            kCFAllocatorDefault, reinterpret_cast<const UInt8*>(fileStr.c_str()),
+            CFIndex(fileStr.size()), false);
+        if (cgImage && url)
+        {
+            CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, nullptr);
+            if (dest)
+            {
+                CGImageDestinationAddImage(dest, cgImage, nullptr);
+                ok = CGImageDestinationFinalize(dest);
+                CFRelease(dest);
+            }
+        }
+        if (url) CFRelease(url);
+        if (cgImage) CGImageRelease(cgImage);
+        if (provider) CGDataProviderRelease(provider);
+        if (colorSpace) CGColorSpaceRelease(colorSpace);
+#endif
         g_context->Unmap(staging.Get(), 0);
         printf("screenshot: %s%s\n", file.string().c_str(), ok ? "" : " could not be written");
         fflush(stdout);
@@ -430,8 +751,23 @@ namespace
 
 void Overlay::Initialize(void* hwnd, ID3D11Device* device, ID3D11DeviceContext* context)
 {
-    if (g_ready.load()) return;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if (g_ready.load())
+    {
+        if (device == g_device && context == g_context)
+        {
+            g_hwnd = static_cast<HWND>(hwnd);
+            return;
+        }
+        g_ready.store(false);
+        ImGui_ImplDX11_Shutdown();
+#ifdef _WIN32
+        ImGui_ImplWin32_Shutdown();
+#endif
+        ImGui::DestroyContext();
+        g_device = nullptr;
+        g_context = nullptr;
+    }
     g_hwnd = static_cast<HWND>(hwnd);
     g_device = device;
     g_context = context;
@@ -447,8 +783,16 @@ void Overlay::Initialize(void* hwnd, ID3D11Device* device, ID3D11DeviceContext* 
     static const ImWchar ranges[] = { 0x0020, 0x00FF, 0x0100, 0x017F, 0 };   // Latin with the Hungarian letters
     ImFontConfig config;
     config.OversampleH = 2;
+#ifdef _WIN32
     if (io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 20.0f * g_fontScale, &config, ranges) == nullptr)
         io.Fonts->AddFontDefault();
+#else
+    if (io.Fonts->AddFontFromFileTTF("/System/Library/Fonts/Supplemental/Arial.ttf", 20.0f * g_fontScale, &config, ranges) == nullptr &&
+        io.Fonts->AddFontFromFileTTF("/System/Library/Fonts/SFNS.ttf", 20.0f * g_fontScale, &config, ranges) == nullptr)
+    {
+        io.Fonts->AddFontDefault();
+    }
+#endif
     ImGui::StyleColorsDark();
     {
         // The title's own front end: dark sepia panels, tan text, the
@@ -513,7 +857,11 @@ void Overlay::Initialize(void* hwnd, ID3D11Device* device, ID3D11DeviceContext* 
         style.FrameBorderSize = 1.0f;
     }
     ImGui::GetStyle().ScaleAllSizes(g_fontScale);
+#ifdef _WIN32
     ImGui_ImplWin32_Init(g_hwnd);
+#else
+    ImGuiSdlInit();
+#endif
     ImGui_ImplDX11_Init(device, context);
     g_tick = std::chrono::steady_clock::now();
     g_ready.store(true);
@@ -576,6 +924,7 @@ void Overlay::RequestScreenshot() { g_screenshotWanted.store(true); }
 
 bool Overlay::HandleMessage(void* hwnd, uint32_t message, uint64_t wParam, int64_t lParam)
 {
+#ifdef _WIN32
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
     {
@@ -612,7 +961,73 @@ bool Overlay::HandleMessage(void* hwnd, uint32_t message, uint64_t wParam, int64
     return message == WM_KEYDOWN || message == WM_KEYUP || message == WM_SYSKEYDOWN || message == WM_SYSKEYUP ||
            message == WM_CHAR || message == WM_MOUSEWHEEL || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
            message == WM_RBUTTONDOWN || message == WM_RBUTTONUP || message == WM_MBUTTONDOWN || message == WM_MBUTTONUP;
+#else
+    (void)hwnd; (void)message; (void)wParam; (void)lParam;
+    return false;
+#endif
 }
+
+#ifndef _WIN32
+bool Overlay::HandleSDLEvent(const void* sdlEvent)
+{
+    if (!sdlEvent) return false;
+    const auto& event = *static_cast<const SDL_Event*>(sdlEvent);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+
+    if (event.type == SDL_KEYDOWN)
+    {
+        if (event.key.keysym.sym == SDLK_F11) { Toggle(); return true; }
+        if (event.key.keysym.sym == SDLK_F12) { RequestScreenshot(); Render::LogNextFrame(); return true; }
+        if (event.key.keysym.scancode == SDL_SCANCODE_GRAVE && !g_open.load() && (Settings::Get().console || g_console.load()))
+        {
+            g_suppressNextGraveText = true;
+            ToggleConsole();
+            return true;
+        }
+        if (event.key.keysym.sym == SDLK_ESCAPE && g_console.load() && !g_open.load())
+        {
+            g_console.store(false);
+            return true;
+        }
+    }
+    if (event.type == SDL_TEXTINPUT && g_suppressNextGraveText)
+    {
+        g_suppressNextGraveText = false;
+        if (g_console.load()) return true;
+    }
+
+    if (!g_ready.load() || (!g_open.load() && !g_console.load())) return false;
+
+    if (g_capturing >= 0)
+    {
+        if (event.type == SDL_KEYDOWN)
+        {
+            const int vk = SdlKeycodeToVk(event.key.keysym.sym);
+            if (vk != 0) Capture(vk);
+            return true;
+        }
+        if (event.type == SDL_MOUSEBUTTONDOWN)
+        {
+            if (event.button.button == SDL_BUTTON_LEFT)   { Capture(VK_LBUTTON);  return true; }
+            if (event.button.button == SDL_BUTTON_RIGHT)  { Capture(VK_RBUTTON);  return true; }
+            if (event.button.button == SDL_BUTTON_MIDDLE) { Capture(VK_MBUTTON);  return true; }
+            if (event.button.button == SDL_BUTTON_X1)     { Capture(VK_XBUTTON1); return true; }
+            if (event.button.button == SDL_BUTTON_X2)     { Capture(VK_XBUTTON2); return true; }
+        }
+    }
+    else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)
+    {
+        g_open.store(false);
+        return true;
+    }
+
+    ImGuiSdlProcessEvent(event);
+    return event.type == SDL_KEYDOWN || event.type == SDL_KEYUP ||
+           event.type == SDL_TEXTINPUT || event.type == SDL_MOUSEWHEEL ||
+           event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP ||
+           event.type == SDL_MOUSEMOTION;
+}
+#endif
 
 void Overlay::Render(ID3D11RenderTargetView* back, ID3D11Texture2D* backTexture, int width, int height)
 {
@@ -639,7 +1054,11 @@ void Overlay::Render(ID3D11RenderTargetView* back, ID3D11Texture2D* backTexture,
     if (!open && !console && !values.fpsOverlay && !values.statsOverlay) return;
 
     ImGui_ImplDX11_NewFrame();
+#ifdef _WIN32
     ImGui_ImplWin32_NewFrame();
+#else
+    ImGuiSdlNewFrame(width, height);
+#endif
     ImGui::NewFrame();
     if (values.fpsOverlay || values.statsOverlay)
     {

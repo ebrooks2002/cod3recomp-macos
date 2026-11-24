@@ -38,4 +38,8 @@ namespace Window
 
     // Wheel notches turned since the last call, positive away from the user.
     int TakeWheel();
+
+    // Runs the window's event pump on the calling thread (macOS requires Cocoa
+    // windowing and event pumping on the main thread).
+    void PumpOnCurrentThread();
 }

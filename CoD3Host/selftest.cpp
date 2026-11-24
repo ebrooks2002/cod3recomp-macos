@@ -1,15 +1,21 @@
 #include "selftest.h"
+#include "audio_out.h"
 #include "coroutines.h"
 #include "gpu.h"
+#include "input.h"
 #include "kernel.h"
+#include "overlay.h"
 #include "render.h"
 #include "render_pipeline.h"
 #include "render_resources.h"
 #include "render_shaders.h"
 #include "render_state.h"
 #include "sampler.h"
+#include "settings.h"
+#include "window.h"
 #include "write_watch.h"
 #include "xenos_hlsl.h"
+#include "xma.h"
 #include "platform.h"
 
 #include <d3d11_1.h>
@@ -1929,6 +1935,309 @@ namespace
         fflush(stdout);
         return 0;
     }
+
+    int RunAudioSelfTest()
+    {
+        printf("=== Gate 6 Self-Test: SDL Windowing, Input, ImGui Overlay, Screenshot, 6->2 Audio & XMA ===\n");
+        fflush(stdout);
+
+        using Microsoft::WRL::ComPtr;
+
+        const std::filesystem::path tempRoot =
+            std::filesystem::temp_directory_path() / ("cod3_gate6_selftest_" + std::to_string(GetCurrentProcessId()));
+        const std::filesystem::path screenshotDir = tempRoot / "screenshots";
+        const std::filesystem::path wavPath = tempRoot / "audiodump.wav";
+        std::error_code ec;
+        std::filesystem::remove_all(tempRoot, ec);
+        std::filesystem::create_directories(screenshotDir, ec);
+        struct ScopedCleanup
+        {
+            std::filesystem::path root;
+            ~ScopedCleanup()
+            {
+                std::error_code cleanupEc;
+                std::filesystem::remove_all(root, cleanupEc);
+            }
+        } cleanupGuard{ tempRoot };
+
+#ifndef _WIN32
+        setenv("COD3_HIDDEN_WINDOW", "1", 1);
+        setenv("COD3_BACKGROUND", "1", 1);
+        setenv("COD3_SCREENSHOT_DIR", screenshotDir.string().c_str(), 1);
+        setenv("COD3_AUDIODUMP", wavPath.string().c_str(), 1);
+        setenv("SDL_AUDIODRIVER", "dummy", 1);
+#endif
+
+        SELFTEST_CHECK(Guest::Initialize(nullptr), "Guest::Initialize(nullptr) failed");
+        SELFTEST_CHECK(Guest::Base != nullptr, "Guest::Base is null");
+
+        // --------------------------------------------------------------------
+        // 1. Settings::Load & DisplayModes + KeyName
+        // --------------------------------------------------------------------
+        Settings::Load(tempRoot);
+        const auto& displayModes = Settings::DisplayModes();
+        SELFTEST_CHECK(!displayModes.empty(), "Settings::DisplayModes returned empty list");
+        SELFTEST_CHECK(std::strcmp(Settings::KeyName('W'), "W") == 0 &&
+                       std::strcmp(Settings::KeyName(VK_SPACE), "Space") == 0,
+            "Settings::KeyName unexpected output ('%s', '%s')",
+            Settings::KeyName('W'), Settings::KeyName(VK_SPACE));
+        printf("  [PASS] 1. Settings::Load, DisplayModes (%zu modes), and KeyName verified\n",
+            displayModes.size());
+
+        // --------------------------------------------------------------------
+        // 2. Window::Open (hidden SDL_WINDOW_METAL window on main thread),
+        //    Window::SetFrontBuffer, and Window::Close
+        // --------------------------------------------------------------------
+        Window::Open();
+        SELFTEST_CHECK(Window::IsOpen() && Window::Handle() != nullptr,
+            "Window::Open failed to create hidden SDL Metal window");
+        Window::SetFrontBuffer(0xA0100000u, 1280, 720);
+
+        // --------------------------------------------------------------------
+        // 3. Dear ImGui Overlay::Initialize, event handling, F11 settings menu
+        //    + console rendering via ImGui_ImplDX11_RenderDrawData, and F12
+        //    CoreGraphics/ImageIO PNG screenshot output.
+        // --------------------------------------------------------------------
+        ComPtr<ID3D11Device> dev;
+        ComPtr<ID3D11DeviceContext> ctx;
+        D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+            nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx);
+        SELFTEST_CHECK(SUCCEEDED(hr) && dev && ctx, "D3D11CreateDevice failed (hr=0x%08X)", unsigned(hr));
+
+        D3D11_TEXTURE2D_DESC backDesc{};
+        backDesc.Width = 320;
+        backDesc.Height = 200;
+        backDesc.MipLevels = 1;
+        backDesc.ArraySize = 1;
+        backDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        backDesc.SampleDesc.Count = 1;
+        backDesc.Usage = D3D11_USAGE_DEFAULT;
+        backDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> backTex;
+        ComPtr<ID3D11RenderTargetView> backRtv;
+        SELFTEST_CHECK(SUCCEEDED(dev->CreateTexture2D(&backDesc, nullptr, &backTex)) && backTex,
+            "CreateTexture2D(backTex) failed");
+        SELFTEST_CHECK(SUCCEEDED(dev->CreateRenderTargetView(backTex.Get(), nullptr, &backRtv)) && backRtv,
+            "CreateRenderTargetView(backRtv) failed");
+
+        const float clearColor[4] = { 0.12f, 0.25f, 0.50f, 1.0f };
+        ctx->ClearRenderTargetView(backRtv.Get(), clearColor);
+
+        Overlay::Initialize(Window::Handle(), dev.Get(), ctx.Get());
+        Overlay::NoteFrame();
+        Overlay::ConsolePrint("Gate 6 overlay self-test line");
+
+        // Open settings menu (F11), render one ImGui frame over backRtv, and request a PNG screenshot.
+        Overlay::Toggle();
+        SELFTEST_CHECK(Overlay::IsOpen(), "Overlay::Toggle did not open settings menu");
+#ifndef _WIN32
+        {
+            SDL_Event moveEv{};
+            moveEv.type = SDL_MOUSEMOTION;
+            moveEv.motion.x = 50;
+            moveEv.motion.y = 50;
+            SELFTEST_CHECK(Overlay::HandleSDLEvent(&moveEv),
+                "Overlay::HandleSDLEvent did not consume mouse event while menu open");
+        }
+#endif
+        Overlay::RequestScreenshot();
+        // Dear ImGui measures newly-created auto-sized windows on frame 1 and renders them on frame 2.
+        Overlay::Render(backRtv.Get(), backTex.Get(), 320, 200);
+        Overlay::Render(backRtv.Get(), backTex.Get(), 320, 200);
+        Overlay::Toggle();
+        SELFTEST_CHECK(!Overlay::IsOpen(), "Overlay::Toggle did not close settings menu");
+
+        // Also test console overlay rendering.
+        Overlay::ToggleConsole();
+        SELFTEST_CHECK(Overlay::IsOpen(), "Overlay::ToggleConsole did not open console");
+        Overlay::Render(backRtv.Get(), backTex.Get(), 320, 200);
+        Overlay::ToggleConsole();
+        SELFTEST_CHECK(!Overlay::IsOpen(), "Overlay::ToggleConsole did not close console");
+
+        // Verify that the PNG screenshot was written with a valid 8-byte PNG signature.
+        bool foundValidPng = false;
+        std::filesystem::path pngFile;
+        for (const auto& entry : std::filesystem::directory_iterator(screenshotDir, ec))
+        {
+            if (!entry.is_regular_file() || entry.path().extension() != ".png") continue;
+            std::ifstream in(entry.path(), std::ios::binary);
+            uint8_t sig[8] = {};
+            in.read(reinterpret_cast<char*>(sig), sizeof(sig));
+            const uint8_t expectedPngSig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+            if (in.gcount() == 8 && std::memcmp(sig, expectedPngSig, 8) == 0)
+            {
+                foundValidPng = true;
+                pngFile = entry.path();
+                break;
+            }
+        }
+        SELFTEST_CHECK(foundValidPng, "Overlay screenshot did not produce a valid PNG file in %s",
+            screenshotDir.string().c_str());
+
+        // Read back the rendered backTex after ImGui draw to confirm non-clear pixels were drawn by ImGui.
+        D3D11_TEXTURE2D_DESC stageDesc = backDesc;
+        stageDesc.Usage = D3D11_USAGE_STAGING;
+        stageDesc.BindFlags = 0;
+        stageDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ComPtr<ID3D11Texture2D> stageTex;
+        SELFTEST_CHECK(SUCCEEDED(dev->CreateTexture2D(&stageDesc, nullptr, &stageTex)) && stageTex,
+            "CreateTexture2D(stageTex) failed");
+        ctx->CopyResource(stageTex.Get(), backTex.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        SELFTEST_CHECK(SUCCEEDED(ctx->Map(stageTex.Get(), 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData,
+            "Map(stageTex) failed");
+        uint32_t imguiDrawnPixels = 0;
+        const uint8_t* baseRow = static_cast<const uint8_t*>(mapped.pData);
+        const uint8_t bgB = baseRow[0], bgG = baseRow[1], bgR = baseRow[2];
+        for (uint32_t y = 0; y < 200; ++y)
+        {
+            const uint8_t* row = baseRow + y * mapped.RowPitch;
+            for (uint32_t x = 0; x < 320; ++x)
+            {
+                if (row[x * 4 + 0] != bgB || row[x * 4 + 1] != bgG || row[x * 4 + 2] != bgR)
+                    imguiDrawnPixels++;
+            }
+        }
+        ctx->Unmap(stageTex.Get(), 0);
+        SELFTEST_CHECK(imguiDrawnPixels > 100,
+            "Expected ImGui overlay to draw >100 pixels onto backbuffer (got %u)", imguiDrawnPixels);
+
+        Window::Close();
+        SELFTEST_CHECK(!Window::IsOpen(), "Window::Close did not mark window closed");
+        printf("  [PASS] 2. SDL Metal window + Dear ImGui overlay rendered (%u UI pixels) and wrote valid PNG (%s)\n",
+            imguiDrawnPixels, pngFile.filename().string().c_str());
+
+        // --------------------------------------------------------------------
+        // 4. Input::State & XamInputGetState guest controller state poll
+        // --------------------------------------------------------------------
+        {
+            const Input::Pad pad = Input::State();
+            const uint32_t pkt = Input::PacketNumber();
+            SELFTEST_CHECK(pkt >= 1 && Input::KeyboardHelp()[0] != '\0',
+                "Input::PacketNumber / KeyboardHelp invalid (pkt=%u)", pkt);
+            (void)pad;
+
+            PPCContext guestCtx{};
+            constexpr uint32_t GuestInputStateAddr = 0x00108000u;
+            std::memset(Guest::Ptr(GuestInputStateAddr), 0xFF, 16);
+            guestCtx.r3.u32 = 0; // userIndex 0
+            guestCtx.r4.u32 = 0;
+            guestCtx.r5.u32 = GuestInputStateAddr;
+            __imp__XamInputGetState(guestCtx, Guest::Base);
+            SELFTEST_CHECK(guestCtx.r3.u32 == 0,
+                "XamInputGetState(user 0) failed with 0x%08X", guestCtx.r3.u32);
+            const uint32_t guestPkt = Guest::Read32(Guest::Base, GuestInputStateAddr);
+            SELFTEST_CHECK(guestPkt == pkt,
+                "XamInputGetState packet number mismatch (guest=%u host=%u)", guestPkt, pkt);
+        }
+        printf("  [PASS] 3. Input::State and XamInputGetState verified\n");
+
+        // --------------------------------------------------------------------
+        // 5. Audio::SubmitFrame 6-channel planar big-endian float -> stereo
+        //    S16LE downmix + SDL2 audio queue + COD3_AUDIODUMP WAV verification
+        // --------------------------------------------------------------------
+        {
+            constexpr uint32_t AudioFrameGuestAddr = 0xA0200000u;
+            constexpr uint32_t SamplesPerCh = 256;
+            constexpr uint32_t NumChannels = 6;
+            auto writeBeFloat = [](uint32_t addr, float v) {
+                uint32_t bits = 0;
+                std::memcpy(&bits, &v, sizeof(bits));
+                Guest::Write32(Guest::Base, addr, bits);
+            };
+            // Populate 6 planar channels: L=+0.5, R=-0.25, C=+0.2, LFE=0.0, LS=+0.1, RS=-0.1
+            const float chValues[NumChannels] = { 0.5f, -0.25f, 0.2f, 0.0f, 0.1f, -0.1f };
+            for (uint32_t ch = 0; ch < NumChannels; ++ch)
+            {
+                for (uint32_t s = 0; s < SamplesPerCh; ++s)
+                    writeBeFloat(AudioFrameGuestAddr + (ch * SamplesPerCh + s) * 4u, chValues[ch]);
+            }
+
+            SELFTEST_CHECK(Audio::SubmitFrame(AudioFrameGuestAddr),
+                "Audio::SubmitFrame failed");
+            Audio::Report();
+            Audio::Close();
+
+            // Verify the dumped WAV header and downmixed stereo samples:
+            // L_out = ToPcm(0.5 + 0.707*0.2 + 0.707*0.1) = ToPcm(0.7121) = int16(0.7121 * 0.8 * 32767) = 18667
+            // R_out = ToPcm(-0.25 + 0.707*0.2 + 0.707*-0.1) = ToPcm(-0.1793) = int16(-0.1793 * 0.8 * 32767) = -4700
+            std::ifstream wavIn(wavPath, std::ios::binary);
+            std::vector<uint8_t> wavBytes((std::istreambuf_iterator<char>(wavIn)),
+                                           std::istreambuf_iterator<char>());
+            SELFTEST_CHECK(wavBytes.size() == 44 + SamplesPerCh * 2 * sizeof(int16_t),
+                "Unexpected WAV dump size (%zu bytes, expected %zu)",
+                wavBytes.size(), size_t(44 + SamplesPerCh * 2 * sizeof(int16_t)));
+            SELFTEST_CHECK(std::memcmp(wavBytes.data(), "RIFF", 4) == 0 &&
+                           std::memcmp(wavBytes.data() + 8, "WAVEfmt ", 8) == 0 &&
+                           std::memcmp(wavBytes.data() + 36, "data", 4) == 0,
+                "Invalid WAV header in %s", wavPath.string().c_str());
+
+            int16_t sampleL = 0, sampleR = 0;
+            std::memcpy(&sampleL, wavBytes.data() + 44, sizeof(int16_t));
+            std::memcpy(&sampleR, wavBytes.data() + 46, sizeof(int16_t));
+            SELFTEST_CHECK(std::abs(int(sampleL) - 18667) <= 2 && std::abs(int(sampleR) - (-4700)) <= 2,
+                "6->2 downmix sample mismatch: got L=%d R=%d (expected L~18667 R~-4700)",
+                int(sampleL), int(sampleR));
+            printf("  [PASS] 4. Audio::SubmitFrame 6-ch planar BE float -> stereo S16LE downmix & WAV dump verified (L=%d, R=%d)\n",
+                int(sampleL), int(sampleR));
+        }
+
+        // --------------------------------------------------------------------
+        // 6. Xma::Available / Create / Reset / Destroy + XMACreateContext /
+        //    XMAInitializeContext / XMAReleaseContext kernel audio round-trip
+        // --------------------------------------------------------------------
+        {
+            if (Xma::Available())
+            {
+                Xma::Stream* s1 = Xma::Create(1, 48000);
+                Xma::Stream* s2 = Xma::Create(2, 44100);
+                SELFTEST_CHECK(s1 != nullptr && s2 != nullptr,
+                    "Xma::Create failed when Xma::Available() is true");
+                Xma::Reset(s1);
+                Xma::Destroy(s1);
+                Xma::Destroy(s2);
+                printf("  [PASS] 5. XMA FFmpeg dynamic loader active: Xma::Create(mono/stereo), Reset, and Destroy verified\n");
+            }
+            else
+            {
+                printf("  [PASS] 5. XMA fallback active (%s)\n", Xma::Unavailable());
+            }
+
+            PPCContext xmaCtx{};
+            constexpr uint32_t CtxOutPtr  = 0x00109000u;
+            constexpr uint32_t InitParams = 0x00109100u;
+            Guest::Write32(Guest::Base, CtxOutPtr, 0);
+            xmaCtx.r3.u32 = CtxOutPtr;
+            __imp__XMACreateContext(xmaCtx, Guest::Base);
+            const uint32_t createdCtx = Guest::Read32(Guest::Base, CtxOutPtr);
+            SELFTEST_CHECK(xmaCtx.r3.u32 == 0 && createdCtx != 0,
+                "XMACreateContext failed (r3=0x%08X ctx=0x%08X)", xmaCtx.r3.u32, createdCtx);
+
+            std::memset(Guest::Ptr(InitParams), 0, 64);
+            Guest::Write32(Guest::Base, InitParams + 5 * 4, 0xA0210000u); // output buffer
+            Guest::Write32(Guest::Base, InitParams + 6 * 4, 8u);          // outputBlocks
+            Guest::Write32(Guest::Base, InitParams + 8 * 4, 2u);          // subframes
+            Guest::Write32(Guest::Base, InitParams + 9 * 4, 1u);          // stereo
+            Guest::Write32(Guest::Base, InitParams + 10 * 4, 3u);         // 48000 Hz
+            xmaCtx = PPCContext{};
+            xmaCtx.r3.u32 = createdCtx;
+            xmaCtx.r4.u32 = InitParams;
+            __imp__XMAInitializeContext(xmaCtx, Guest::Base);
+            SELFTEST_CHECK(xmaCtx.r3.u32 == 0, "XMAInitializeContext failed");
+
+            xmaCtx = PPCContext{};
+            xmaCtx.r3.u32 = createdCtx;
+            __imp__XMAReleaseContext(xmaCtx, Guest::Base);
+            SELFTEST_CHECK(xmaCtx.r3.u32 == 0, "XMAReleaseContext failed");
+            printf("  [PASS] 6. XMACreateContext / XMAInitializeContext / XMAReleaseContext kernel round-trip verified\n");
+        }
+
+        Guest::Shutdown();
+        printf("=== Gate 6 Self-Test: ALL WINDOW, INPUT, OVERLAY & AUDIO ASSERTIONS PASSED ===\n");
+        fflush(stdout);
+        return 0;
+    }
 }
 
 namespace SelfTest
@@ -1959,12 +2268,13 @@ namespace SelfTest
             if (rc != 0 || suite == "render")
                 return rc;
         }
-        if (suite == "audio")
+        if (suite == "audio" || suite == "all")
         {
-            fprintf(stderr, "Self-test suite '%s' is not implemented yet.\n", suite.c_str());
-            return 1;
+            const int rc = RunAudioSelfTest();
+            if (rc != 0 || suite == "audio")
+                return rc;
         }
-        if (suite != "vm" && suite != "runtime" && suite != "render" && suite != "all")
+        if (suite != "vm" && suite != "runtime" && suite != "render" && suite != "audio" && suite != "all")
         {
             fprintf(stderr, "Unknown self-test suite '%s' (expected vm, runtime, render, audio, or all).\n",
                 suite.c_str());

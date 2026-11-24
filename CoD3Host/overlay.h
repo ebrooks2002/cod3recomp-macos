@@ -22,6 +22,9 @@ namespace Overlay
     // The window procedure hands every message here first; true when it
     // was the menu's.
     bool HandleMessage(void* hwnd, uint32_t message, uint64_t wParam, int64_t lParam);
+#ifndef _WIN32
+    bool HandleSDLEvent(const void* sdlEvent);
+#endif
 
     // The settings menu or the console is up: the keys and the mouse are
     // theirs, not the title's.

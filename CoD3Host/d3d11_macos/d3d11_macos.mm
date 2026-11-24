@@ -3370,6 +3370,14 @@ static void DeviceAddPrivateRef(Cod3Device* dev) { dev->AddPrivateRef(); }
 static void DeviceReleasePrivateRef(Cod3Device* dev) { dev->ReleasePrivateRef(); }
 static ID3D11Device* DeviceInterface(Cod3Device* dev) { return static_cast<ID3D11Device*>(dev); }
 
+static void RunOnMainThreadSync(void (^block)(void)) {
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+}
+
 struct Cod3SwapChain final : public IDXGISwapChain2 {
     Cod3Device* device = nullptr;
     HWND hwnd = nullptr;
@@ -3387,21 +3395,40 @@ struct Cod3SwapChain final : public IDXGISwapChain2 {
 
         if (hwnd) {
             auto* sdlWin = static_cast<SDL_Window*>(hwnd);
-            metalView = SDL_Metal_CreateView(sdlWin);
-            if (metalView) {
-                metalLayer = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(metalView);
-                metalLayer.device = device->mtlDevice;
-                metalLayer.pixelFormat = ToMtlPixelFormat(desc.Format);
-                metalLayer.framebufferOnly = NO;
-                metalLayer.drawableSize = CGSizeMake(desc.Width, desc.Height);
-            }
+            id<MTLDevice> mtlDev = device->mtlDevice;
+            const MTLPixelFormat pxFmt = ToMtlPixelFormat(desc.Format);
+            const CGSize drawSize = CGSizeMake(desc.Width, desc.Height);
+            __block SDL_MetalView createdView = nullptr;
+            __block CAMetalLayer* createdLayer = nil;
+            RunOnMainThreadSync(^{
+                createdView = SDL_Metal_CreateView(sdlWin);
+                if (createdView) {
+                    createdLayer = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(createdView);
+                    createdLayer.device = mtlDev;
+                    createdLayer.pixelFormat = pxFmt;
+                    createdLayer.framebufferOnly = NO;
+                    createdLayer.drawableSize = drawSize;
+                }
+            });
+            metalView = createdView;
+            metalLayer = createdLayer;
         }
         CreateBackBuffer();
     }
 
     ~Cod3SwapChain() override {
         if (backBuffer) backBuffer->Release();
-        if (metalView) SDL_Metal_DestroyView(metalView);
+        if (metalView) {
+            SDL_MetalView view = metalView;
+            metalView = nullptr;
+            if ([NSThread isMainThread]) {
+                SDL_Metal_DestroyView(view);
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    SDL_Metal_DestroyView(view);
+                });
+            }
+        }
         if (device) device->Release();
     }
 
@@ -3448,7 +3475,13 @@ struct Cod3SwapChain final : public IDXGISwapChain2 {
         if (Height > 0) desc.Height = Height;
         if (NewFormat != DXGI_FORMAT_UNKNOWN) desc.Format = NewFormat;
         if (metalLayer) {
-            metalLayer.drawableSize = CGSizeMake(desc.Width, desc.Height);
+            CAMetalLayer* layer = metalLayer;
+            const CGSize drawSize = CGSizeMake(desc.Width, desc.Height);
+            const MTLPixelFormat pxFmt = ToMtlPixelFormat(desc.Format);
+            RunOnMainThreadSync(^{
+                layer.pixelFormat = pxFmt;
+                layer.drawableSize = drawSize;
+            });
         }
         CreateBackBuffer();
         return S_OK;
@@ -3715,6 +3748,7 @@ extern "C" HRESULT WINAPI D3DCompile(
     if (!shader.parse(GetDefaultResources(), 100, false, messages)) {
         const char* log = shader.getInfoLog();
         if (ppErrorMsgs && log) *ppErrorMsgs = new Cod3Blob(log, std::strlen(log) + 1);
+        else if (log) fprintf(stderr, "d3d11_macos: D3DCompile parse failed: %s\n", log);
         return E_FAIL;
     }
 
@@ -3723,6 +3757,7 @@ extern "C" HRESULT WINAPI D3DCompile(
     if (!program.link(messages) || !program.mapIO()) {
         const char* log = program.getInfoLog();
         if (ppErrorMsgs && log) *ppErrorMsgs = new Cod3Blob(log, std::strlen(log) + 1);
+        else if (log) fprintf(stderr, "d3d11_macos: D3DCompile link/mapIO failed: %s\n", log);
         return E_FAIL;
     }
 
@@ -3767,7 +3802,7 @@ extern "C" HRESULT WINAPI D3DCompile(
         for (const auto& r : resources.separate_images) {
             uint32_t spvBind = msl.get_decoration(r.id, spv::DecorationBinding);
             uint32_t mslBind = msl.get_automatic_msl_resource_binding(r.id);
-            uint32_t d3dSlot = (spvBind >= 64) ? (spvBind - 64) : spvBind;
+            uint32_t d3dSlot = (spvBind >= 64) ? (spvBind - 64) : 0;
             if (mslBind != uint32_t(-1)) {
                 srvTexBindings.push_back({ uint16_t(d3dSlot), uint16_t(mslBind) });
             }
@@ -3777,7 +3812,7 @@ extern "C" HRESULT WINAPI D3DCompile(
         for (const auto& r : resources.separate_samplers) {
             uint32_t spvBind = msl.get_decoration(r.id, spv::DecorationBinding);
             uint32_t mslBind = msl.get_automatic_msl_resource_binding(r.id);
-            uint32_t d3dSlot = (spvBind >= 192) ? (spvBind - 192) : spvBind;
+            uint32_t d3dSlot = (spvBind >= 192) ? (spvBind - 192) : 0;
             if (mslBind != uint32_t(-1)) {
                 samplerBindings.push_back({ uint16_t(d3dSlot), uint16_t(mslBind) });
             }
@@ -3866,6 +3901,8 @@ extern "C" HRESULT WINAPI D3DCompile(
         if (ppErrorMsgs) {
             const char* msg = e.what();
             *ppErrorMsgs = new Cod3Blob(msg, std::strlen(msg) + 1);
+        } else {
+            fprintf(stderr, "d3d11_macos: D3DCompile exception: %s\n", e.what());
         }
         return E_FAIL;
     }

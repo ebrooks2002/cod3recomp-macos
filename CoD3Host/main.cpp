@@ -284,7 +284,9 @@ int Run(int argc, char** argv)
     ctx.r1.u32 = Guest::StackBase - 0x100;
     ctx.r13.u32 = Guest::CreateThreadPointer(1);
     ctx.fpscr.loadFromHost();
+#ifdef _WIN32
     Kernel::SetCurrentContext(&ctx);
+#endif
 
     // Reports where the guest threads are, so a stall in translated code can be
     // located without a debugger.
@@ -292,8 +294,10 @@ int Run(int argc, char** argv)
     // first moment, rather than a console and nothing else.
     Window::Open();
 
+#ifdef _WIN32
     Scheduler::Attach(Guest::CurrentProcessor(ctx));
     Kernel::RegisterEntryThread();
+#endif
     Sampler::Start(10);
     Kernel::StartWatchdog();
 
@@ -424,6 +428,7 @@ int Run(int argc, char** argv)
     printf("\nEntering guest code at _xstart\n");
     fflush(stdout);
 
+#ifdef _WIN32
     _xstart(ctx, Guest::Base);
 
     // Reaching here would mean the guest returned from its entry point, which
@@ -431,6 +436,46 @@ int Run(int argc, char** argv)
     printf("\nGuest returned from _xstart with r3 = 0x%08X\n", ctx.r3.u32);
     Guest::Shutdown();
     return 0;
+#else
+    struct GuestStart
+    {
+        PPCContext ctx;
+    };
+    auto* start = new GuestStart{ ctx };
+    HANDLE entryThread = CreateThread(nullptr, 16u << 20, [](void* param) -> DWORD {
+        auto* s = static_cast<GuestStart*>(param);
+        alignas(0x40) PPCContext localCtx = s->ctx;
+        delete s;
+        localCtx.fpscr.loadFromHost();
+        Kernel::RecordThreadPointer(GetCurrentThreadId(), localCtx.r13.u32);
+        Guest::Write32(Guest::Base, localCtx.r13.u32 + 0x10C, GetCurrentThreadId());
+        Kernel::SetCurrentContext(&localCtx);
+        Scheduler::Attach(Guest::CurrentProcessor(localCtx));
+        Kernel::RegisterEntryThread();
+        Kernel::ArmWatchpoints();
+
+        _xstart(localCtx, Guest::Base);
+
+        printf("\nGuest returned from _xstart with r3 = 0x%08X\n", localCtx.r3.u32);
+        fflush(stdout);
+        Window::Close();
+        return 0;
+    }, start, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (entryThread == nullptr)
+    {
+        delete start;
+        fprintf(stderr, "Could not start guest entry thread.\n");
+        Window::Close();
+        Guest::Shutdown();
+        return 1;
+    }
+    CloseHandle(entryThread);
+
+    // On macOS, the main thread owns the Cocoa / SDL window and pumps its events.
+    Window::PumpOnCurrentThread();
+    Guest::Shutdown();
+    return 0;
+#endif
 }
 
 }   // namespace

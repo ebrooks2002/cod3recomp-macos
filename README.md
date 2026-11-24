@@ -63,6 +63,35 @@ turns that off for anyone who wants the pointer's travel back.
 | F12 | screenshot into `screenshots/`, the next two frames' draws into `CoD3.log`, and a small picture after each draw of the next frame (`screenshots/*-draws.bin`): press it when something looks wrong |
 | ` (the key left of 1) | the console, when the settings' Gameplay page turns it on |
 
+### Game Controls (macOS)
+
+On macOS, keyboard, mouse, and USB/Bluetooth controllers (Xbox, PlayStation, etc.) are handled through SDL2.
+
+| Action | Mac Key / Mouse | Xbox 360 Equivalent |
+| --- | --- | --- |
+| Move | `W` `A` `S` `D` | Left Stick |
+| Look | Mouse movement | Right Stick |
+| Fire / Aim | Left Click / Right Click | `RT` / `LT` |
+| Jump / Select (menus) / Skip movies | `Space` | `A` |
+| Crouch / Back (menus) | `C` | `B` |
+| Reload / Use / **Pick up weapon (hold)** | `R` or `E` (hold to pick up / interact) | `X` |
+| Switch weapon | `F` or Mouse Wheel | `Y` |
+| Melee | `V` | Right Stick Click (`RS`) |
+| Sprint | `Shift` | Left Stick Click (`LS`) |
+| Frag / Smoke grenade | `G` / `4` | `RB` / `LB` |
+| Objectives | `Tab` | `Back` |
+| Pause / Release mouse cursor | `Esc` | `Start` |
+| Menu navigation | `Arrow keys`, `Return` / `Space` | D-Pad, `A` |
+| Settings & key rebinding | `F11` (or `Fn + F11` on MacBooks) | — |
+| Screenshot (PNG) + draw log | `F12` (or `Fn + F12` on MacBooks) | — |
+| Toggle borderless fullscreen | `Option + Return` | — |
+| Developer console | `` ` `` (when enabled in Settings → Gameplay) | — |
+
+**macOS tips:**
+- **Function keys:** If `F11` / `F12` trigger macOS Show Desktop or Volume instead of the in-game menu/screenshot, hold `Fn` (`Fn + F11` / `Fn + F12`) or enable *"Use F1, F2, etc. keys as standard function keys"* in System Settings → Keyboard.
+- **Mouse capture:** Click inside the window during gameplay to lock the cursor for looking; press `Esc` or `F11` to release it.
+- **PC button prompts:** Place `2EC285278173B714_pc_buttons.png` in `textures/` (next to the `CoD3` binary or in the repo root) to replace the Xbox 360 button prompts with keyboard/mouse icons; remove it to restore Xbox prompts.
+
 The settings menu (F11, and it opens by itself when OPTIONS is chosen in
 the title's main menu, over the title's own options page) has the window
 mode (windowed or borderless full screen; Alt+Enter switches too), the
@@ -118,7 +147,7 @@ PowerPC instruction tests, and all 16 that have a test pass.
 
 ### macOS (Apple Silicon ARM64)
 
-Requires Xcode Command Line Tools (`AppleClang`), CMake 3.20+, Ninja, Python 3, `glslang`, `spirv-cross`, and `sdl2` (`brew install cmake ninja glslang spirv-cross sdl2`).
+Requires Xcode Command Line Tools (`AppleClang`), CMake 3.20+, Ninja, Python 3, `glslang`, `spirv-cross`, `sdl2`, and `ffmpeg` (`brew install cmake ninja glslang spirv-cross sdl2 ffmpeg`).
 
 1. Initialize submodules and apply the `XenonRecomp` patch:
    ```bash
@@ -145,6 +174,8 @@ Requires Xcode Command Line Tools (`AppleClang`), CMake 3.20+, Ninja, Python 3, 
 ./scripts/verify.sh          # the instructions this project added
 ./scripts/verify.sh --all    # every test Xenia has that PpcAsm encodes cleanly
 ./build/CoD3Host/CoD3 --self-test=render   # Gate 5: shader translation, cache, D3D11->Metal parity, swap chain
+./build/CoD3Host/CoD3 --self-test=audio    # Gate 6: SDL Metal window, input, ImGui overlay, PNG screenshot, 6->2 audio & XMA
+./build/CoD3Host/CoD3 --self-test=all      # Run all self-test gates (vm, runtime, render, audio)
 ```
 
 Assembles Xenia's instruction tests, recompiles them the same way the game's
